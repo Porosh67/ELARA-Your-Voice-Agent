@@ -1,36 +1,66 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Elara AI
 
-## Getting Started
+Your secure, real-time **voice friend** — a Next.js 16 app with Supabase Auth,
+a premium marketing site, and a voice-first product surface.
 
-First, run the development server:
+## Stack
+
+- **Next.js 16** — App Router, Turbopack, `proxy.ts` (the Next 16 successor to `middleware.ts`)
+- **React 19** + **TypeScript (strict)**
+- **Tailwind CSS v4** — CSS-first `@theme` tokens, class-based dark mode
+- **Motion** — animations, globally gated on `prefers-reduced-motion`
+- **lucide-react** — icons
+- **Supabase** — Auth (email / Google / anonymous) + Postgres with Row Level Security
+- **next-themes** — Dark / Light / System theming with no flash on load
+- **AssemblyAI** — real-time streaming speech-to-text (`universal-3-5-pro`), reached via a server-minted temporary token
+- **Web Audio API + SpeechSynthesis** — microphone capture and voice playback, both browser-native
+
+## Getting started
 
 ```bash
+npm install
+cp .env.local.example .env.local   # then fill in your Supabase keys
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Full setup (Supabase project, migration, auth providers, redirect URLs) is in
+[`SETUP.md`](./SETUP.md).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Routes
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Route | Description |
+| --- | --- |
+| `/` | Landing page — aurora hero, features, security, CTAs (auth-aware header) |
+| `/login` · `/signup` | Email + Google + guest sign-in |
+| `/app` | Protected app surface — real-time voice loop; redirects to `/login` when unauthenticated |
+| `/api/voice/token` | Server route that mints a short-lived AssemblyAI streaming token (401 without a session) |
 
-## Learn More
+## Scripts
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm run dev     # development server
+npm run build   # production build
+npm run start   # production server
+npm run lint    # eslint
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Design system
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Dark (`#09090b`) / light / system theming with indigo (`#6366f1`) as the brand
+color. All tokens live in `app/globals.css` and are exposed to Tailwind v4 via
+`@theme inline`, so every utility resolves the active theme at runtime. See the
+**Theming** section of [`SETUP.md`](./SETUP.md) for the rules.
 
-## Deploy on Vercel
+## Voice loop (Phase 2, Day 1)
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+`/app` runs a real-time voice loop: microphone → AssemblyAI streaming STT →
+(language-aware) reply → browser speech synthesis. See the
+**Voice loop** section of [`SETUP.md`](./SETUP.md) for setup and the language
+support matrix.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Requires `ASSEMBLYAI_API_KEY` in `.env.local` (server-only — the browser only
+ever receives a short-lived, single-use token). While the key is unset the voice
+UI still loads and reports that it is not configured.
+
+The reply brain is currently a placeholder (`lib/voice/stub-brain.ts`); speech
+recognition, the state machine, and TTS are the real implementation.
