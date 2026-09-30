@@ -25,6 +25,12 @@ export async function googleGenerate(options: {
   temperature?: number;
   maxOutputTokens?: number;
   timeoutMs: number;
+  /**
+   * Optional response MIME type. `"application/json"` puts the model in JSON
+   * mode, so a structured-output caller gets parseable JSON instead of prose.
+   * Omitted by every other caller, so nothing else changes.
+   */
+  responseMimeType?: string;
 }): Promise<string | null> {
   const apiKey = getGoogleAiApiKey();
 
@@ -42,6 +48,11 @@ export async function googleGenerate(options: {
       maxOutputTokens: options.maxOutputTokens ?? 256,
     },
   };
+
+  if (options.responseMimeType) {
+    (body.generationConfig as Record<string, unknown>).responseMimeType =
+      options.responseMimeType;
+  }
 
   if (options.system) {
     body.systemInstruction = { parts: [{ text: options.system }] };

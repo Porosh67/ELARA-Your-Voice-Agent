@@ -36,6 +36,12 @@ export const GROQ_MODELS = {
    * instructions → "unsafe").
    */
   outputGuard: "openai/gpt-oss-safeguard-20b",
+  /**
+   * The SECOND attempt at the meaning-based router, used only when Google AI
+   * cannot answer in time. It is a reasoning model, so it reasons before it
+   * emits the JSON — the budget leaves room for that.
+   */
+  router: "openai/gpt-oss-120b",
 } as const;
 
 /**
@@ -53,6 +59,14 @@ export const GOOGLE_MODELS = {
   /** Step 2 — fast assist draft. Hard-capped at 800 ms and fired alongside the
    *  main model, so it can never hold the voice loop open. */
   fastAssist: "gemini-3.5-flash-lite",
+  /**
+   * The MEANING-based router. Same configured model as the assist (no new
+   * model id, no new key): it decides CHAT vs LIVE from what the turn MEANS in
+   * any language, which is what lets ELARA cover any topic without a keyword
+   * list. Runs concurrently with the input guard, hard-capped, and defaults to
+   * CHAT on any failure so it can never arm a search by accident.
+   */
+  router: "gemini-3.5-flash-lite",
   /** Background — memory embeddings. */
   embedding: "gemini-embedding-2",
   /** Background — quality check. */
@@ -94,6 +108,8 @@ export const BRAIN_TOKEN_BUDGETS = {
   respond: 1500,
   /** Fast assist is a small non-reasoning model. */
   fastAssist: 400,
+  /** The router emits a two-field JSON object; a small budget is plenty. */
+  router: 120,
   /** Short rewrite, but still a reasoning model. */
   reorganize: 900,
   /** Safety verdict needs a reasoning pass before `safe` / `unsafe`. */
@@ -107,17 +123,38 @@ export const BRAIN_TOKEN_BUDGETS = {
  */
 export const BRAIN_TIMEOUTS_MS = {
   inputGuard: 2500,
+  /**
+   * The meaning-based router's hard ceiling.
+   *
+   * It runs CONCURRENTLY with the main model and the assist, so this is the
+   * most it can ever add to a turn. Measured against the live endpoint it is
+   * bimodal: 0.9–2.0 s when Gemini answers, and a full stall to the ceiling when
+   * it does not. 1.2 s aborted almost every call and the router silently
+   * degraded to the regexes; 2.5 s still cut off valid answers and left the
+   * route decided by a TIMEOUT rather than a decision, which is how a live
+   * question about an unlisted topic kept being answered from memory.
+   *
+   * 6 s accepts the slow-but-real answer instead of guessing, and costs nothing
+   * on a simple-chat turn (which skips the router) or a deterministic LIVE turn
+   * (which never fires it). A turn is always max(main, assist, router) — never
+   * the sum — so this cannot stack behind the responder's own 12 s budget.
+   */
+  router: 6000,
   respond: 12000,
   /**
-   * Bright Data launches a real browser for one SERP fetch: a typical
-   * request takes 2–6 s (Light JSON — requested explicitly on every attempt —
-   * is about twice as fast as Full JSON). The old 3500 ms abort killed most
-   * SUCCESSFUL requests mid-flight; 13 s (inside the 12–14 s window) covers a
-   * slow live fetch while still bounding the turn. It is ONE shared deadline:
-   * backoff waits and per-attempt aborts are computed from it, so retries for
-   * a gateway reject / empty body / timeout can never extend a lookup past it.
+   * Bright Data launches a real browser for one SERP fetch, and measured on
+   * this account a successful request lands at 2.4–6.7 s. A hung request — the
+   * gateway is flaky, roughly 1 attempt in 4 — otherwise burns the whole
+   * budget in silence, which is dead air in a voice loop.
+   *
+   * 6.5 s is the ONE shared budget for a whole lookup: backoff waits and
+   * per-attempt aborts are computed from it, so a gateway-reject retry can
+   * never extend a turn past it. A timeout is never retried at all (see
+   * `serpSearchDetailed`), and two consecutive timeouts open a process-local
+   * circuit breaker for a minute so the honest line is spoken immediately
+   * instead of after a silent wait.
    */
-  search: 13000,
+  search: 6500,
   /**
    * Step 2's hard ceiling — locked at 800 ms.
    *

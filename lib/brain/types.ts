@@ -108,13 +108,18 @@ export const WEATHER_UNAVAILABLE_REPLY_BN =
  * Kept separate from the two lines above on purpose: telling someone the search
  * is offline when it just worked is a lie, and small lies are how an assistant
  * stops feeling trustworthy.
+ *
+ * The wording is deliberately Elara's own rather than the person's: this line
+ * is said AFTER a search that worked, so it must not read as a request for the
+ * question again, and it must not apologise for something that is not the
+ * listener's fault.
  */
 export const SEARCH_SYNTHESIS_FAILED_REPLY =
-  "I found something but couldn't put it into words just now — ask me once more?";
+  "I found something, but I can't make sense of it just yet — try asking me a slightly different way?";
 
 /** Bangla twin of the line above — same situation, locked language. */
 export const SEARCH_SYNTHESIS_FAILED_REPLY_BN =
-  "ফলাফল পেয়েছি, তবে এই মুহূর্তে ঠিকমতো বুঝিয়ে বলতে পারছি না — আবার বলবেন?";
+  "ফলাফল পেয়েছি, তবে এই মুহূর্তে ঠিকমতো বুঝিয়ে বলতে পারছি না — আবার ভিন্নভাবে জিজ্ঞেস করবেন?";
 
 /*
  * Time and date questions are the one lookup Elara must NEVER answer from

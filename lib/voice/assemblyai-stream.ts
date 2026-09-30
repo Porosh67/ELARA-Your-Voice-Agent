@@ -264,25 +264,38 @@ export class AssemblyAiStream {
         }
 
         if (turn.end_of_turn) {
-          /* A finalized turn can arrive twice: AssemblyAI re-emits the same
-           * turn_order with a (usually identical) formatted transcript.
+          /*
+           * A finalized turn can arrive more than once: AssemblyAI re-emits the
+           * same turn_order with a (usually identical) formatted transcript.
            * Forwarding both showed duplicate bubbles in the UI and triggered
-           * two brain calls for one utterance, so repeats are dropped here —
-           * by turn_order when present, otherwise by identical text.
+           * two brain calls for one utterance — one of which then rendered as a
+           * user turn with no reply beside it.
+           *
+           * THE OLD TEST WAS FRAGILE IN TWO WAYS. It compared against only the
+           * single previous final, and it chose ONE strategy based on whether
+           * that turn happened to carry a turn_order. A re-emit that dropped
+           * the field fell through to a text comparison against a turn_order
+           * turn whose text had never been recorded, so the duplicate sailed
+           * through. Both signals are now recorded independently and BOTH must
+           * indicate a repeat before the frame is dropped.
            */
           const turnOrder =
             typeof turn.turn_order === "number" ? turn.turn_order : null;
+          const normalized = transcript.toLowerCase();
 
-          if (
-            turnOrder !== null
-              ? turnOrder === this.lastFinalTurnOrder
-              : transcript.toLowerCase() === this.lastFinalText
-          ) {
+          const sameOrder =
+            turnOrder !== null && turnOrder === this.lastFinalTurnOrder;
+          const sameText = normalized === this.lastFinalText;
+
+          if (sameOrder || sameText) {
             return;
           }
 
-          this.lastFinalTurnOrder = turnOrder;
-          this.lastFinalText = transcript.toLowerCase();
+          if (turnOrder !== null) {
+            this.lastFinalTurnOrder = turnOrder;
+          }
+
+          this.lastFinalText = normalized;
 
           /*
            * The reported language rides along with the finalized text, but

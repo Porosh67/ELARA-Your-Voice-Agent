@@ -12,6 +12,7 @@ import { groqChat } from "@/lib/brain/providers/groq";
 import type { GroqMessage } from "@/lib/brain/providers/groq";
 import { serpSearchDetailed } from "@/lib/brain/providers/brightdata";
 import type { SerpResult } from "@/lib/brain/providers/brightdata";
+import { classifyTurnSemantics } from "@/lib/brain/stages/router";
 import { isBrightDataConfigured } from "@/lib/brain/env";
 import {
   classifyRequest,
@@ -300,6 +301,24 @@ function findSearchQuery(reply: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+/**
+ * A reply with its pipeline marker removed, ready to be spoken.
+ *
+ * `[SEARCH: …]` is an instruction to the pipeline, never speech. When the
+ * synthesiser emits one it has usually ALREADY written the answer around it, so
+ * deleting the whole reply and falling back to "I couldn't put it into words"
+ * threw away a perfectly good grounded answer. Returns `null` only when
+ * nothing but the marker was there.
+ */
+function stripSearchMarker(reply: string | null): string | null {
+  if (typeof reply !== "string") {
+    return null;
+  }
+
+  const cleaned = reply.replace(SEARCH_MARKER, " ").replace(/\s{2,}/g, " ").trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
 
 /*
  * FULL-TURN LANGUAGE DIRECTIVE — one entry per accepted language, enforced
@@ -398,6 +417,23 @@ function isSpeakableReply(text: string | null): text is string {
 const EXPLICIT_SEARCH_INTENT =
   /\b(?:search|look\s+(?:it\s+|that\s+)?up|find\s+out|google|web\s*search)\b/i;
 
+/**
+ * A META TURN — the person talking ABOUT looking things up rather than asking
+ * for a lookup.
+ *
+ * Observed: "I can't understand why you sometimes can live search and sometimes
+ * not. What's the problem?" armed a real search, because the bare word "search"
+ * inside "live search" matched the explicit-verb class. The assistant then
+ * answered a question about its own behaviour with a weather-style refusal.
+ *
+ * This is not a topic list. It recognises the SHAPE of a turn whose subject is
+ * the act of searching — a complaint or a question about it — and requires that
+ * shape to be the WHOLE turn, so "why does live search not work?" stays a
+ * conversation while "search the price of gold" still reaches the web.
+ */
+const SEARCH_META_TURN =
+  /^\s*(?:i\s+)?(?:can'?t|can\s*not|cannot|don'?t|do\s+not|couldn'?t|could\s+not|why\s+(?:does|do|is|are|did|can'?t|doesn'?t)|how\s+(?:come|does|do|is)|what'?s|whats|explain|tell\s+me\s+about|but|and|so|that'?s|thats|your|elara'?s|elaras)\b[^.?!]{0,80}\b(?:live\s+search|web\s+search|search(?:ing)?\s+(?:sometimes|not|never|always|fail\w*|work\w*|break\w*|offline|unavailable)|google|internet|online|look\s*up)\b|\b(?:problem|issue|error|bug|wrong|mistake|reason)\b[^.?!]{0,60}\b(?:search|look\s*up|google)\b[^.?!]{0,40}\b\??\s*$/i;
+
 const LIVE_FACT_DOMAINS =
   /\b(?:weather|forecast|temperature|humidity|rain|snow|news|headlines?|breaking|scores?|who\s+won|who'?s\s+winning|match\s+result|fixtures?|prices?|exchange\s+rate|stocks?|shares|market\s+cap|gas\s+price|fuel\s+price|opening\s+hours|open\s+now|timetable|schedule|traffic|flight\s+status|delays?|release\s+date|election\s+results?|polls?|rankings?|standings|latest)\b/i;
 
@@ -417,6 +453,22 @@ const LIVE_FACT_DOMAINS =
  */
 const CURRENT_EVENTS_INTENT =
   /\bwhat(?:'?s|\s+is)\s+(?:happening|going\s+on)\b|\bwhat\s+happened\b|\bwhat'?s\s+new\b|\b(?:anything|something)\s+(?:new|happening|going\s+on)\b|\bcurrent\s+events?\b/i;
+
+/**
+ * "Another one / something new" ABOUT THE CONVERSATION.
+ *
+ * The current-events class above treats a bare "anything new?" as a request for
+ * news, which is right out of the blue and wrong in context: after a joke,
+ * "that's very familiar — anything new?" is unmistakably a request for ANOTHER
+ * JOKE, and searching for it made Elara answer a news question nobody asked.
+ *
+ * This is not a topic list. It recognises the SHAPE of a conversational
+ * continuation — a request for more of what was just offered — and only when
+ * the turn carries no subject of its own to look up. A turn that names a
+ * subject ("anything new about the election?") still reaches the search path.
+ */
+const CONVERSATIONAL_MORE_INTENT =
+  /^\s*(?:that(?:'|’)?s\s+)?(?:very\s+|too\s+|so\s+|really\s+)?(?:familiar|similar|funny|good|nice|great|old)\b[^.?!]{0,40}[?.!]?\s*(?:and\s+)?(?:anything|something|anything\s+else)\s+new\b|^\s*(?:anything|something)\s+new\s*\?\s*$|^\s*(?:do\s+you\s+have\s+)?(?:any|another)\s+(?:more\s+)?(?:jokes?|ones?|stories|riddles|examples)\b/i;
 
 /**
  * Opinion and commentary markers.
@@ -466,6 +518,29 @@ const LIVE_TIME_INTENT =
  * is what separates them here, so praise never arms a lookup.
  */
 const EXCLAMATION_GUARD = /^(?:what|such)\s+(?:a|an)\b/i;
+
+/**
+ * AN EXPLICIT FRESHNESS QUALIFIER — "right now", "currently", "these days".
+ *
+ * This is a rule about TIME, not about topics, and it is the safety net that
+ * keeps live coverage from depending on a model call. Measured: the meaning
+ * router answers in 0.6 s or 6 s on the same prompt depending on nothing the
+ * caller controls, and when BOTH configured providers missed their budget the
+ * router returned nothing and "who is the best golf player in the world RIGHT
+ * NOW?" was answered from a model with no idea what year it was.
+ *
+ * So a turn that names a present-moment qualifier AND asks a question is armed
+ * for a lookup whatever it is about — a ranking, a price, an office holder, a
+ * release, a country's state. No subject is listed anywhere, and none is
+ * needed: the qualifier is what makes the answer age.
+ *
+ * The ASK shape is required, or a remark ("prices are crazy these days") would
+ * ban the memory answer on a turn that never needed the web — that is the
+ * `COMMENTARY_GUARD` case above.
+ */
+const FRESHNESS_QUALIFIER =
+  /\b(?:right\s+now|as\s+of\s+(?:now|today)|at\s+the\s+moment|currently|at\s+present|these\s+days|nowadays|this\s+(?:year|month|week)|latest|current|up\s+to\s+date|so\s+far\s+today)\b/i;
+
 
 /**
  * Chat that must never be sent to the live web — even when it mentions a
@@ -652,6 +727,16 @@ export function detectLiveIntent(userText: string): string | null {
     return null;
   }
 
+  /*
+   * "Another one / something new" about what was just said is a continuation of
+   * the conversation, not a request for the world. Checked BEFORE the
+   * current-events class, which would otherwise read a bare "anything new?" as
+   * news. Only a turn that names a subject of its own still reaches the search.
+   */
+  if (CONVERSATIONAL_MORE_INTENT.test(userText)) {
+    return null;
+  }
+
   // "ki khobor?" / "কি খবর?" is a greeting — unless a freshness qualifier
   // follows, which makes the very same words a news request.
   if (BANGLA_GREETING_GUARD.test(userText) && !NEWS_QUALIFIER.test(userText)) {
@@ -661,10 +746,11 @@ export function detectLiveIntent(userText: string): string | null {
   /*
    * An EXPLICIT lookup verb ("look up", "google it", "search kore bolo") is a
    * request on its own and outranks every guard below: the person said what
-   * they want.
+   * they want. A turn that is only ABOUT looking things up is not a request.
    */
   const explicitAsk =
-    EXPLICIT_SEARCH_INTENT.test(userText) || BANGLA_EXPLICIT_SEARCH.test(userText);
+    !SEARCH_META_TURN.test(userText) &&
+    (EXPLICIT_SEARCH_INTENT.test(userText) || BANGLA_EXPLICIT_SEARCH.test(userText));
 
   /*
    * A volatile subject only counts when the turn ASKS about it. A remark
@@ -701,11 +787,25 @@ export function detectLiveIntent(userText: string): string | null {
     !remark &&
     (BANGLA_TIME_INTENT.test(userText) || BANGLISH_TIME_INTENT.test(userText));
 
+  /*
+   * AN EXPLICIT FRESHNESS QUALIFIER plus a question is a live ask, whatever it
+   * is about. This is what keeps coverage from resting on a model call: the
+   * meaning router is fast when it works and misses its budget often enough
+   * that "the best golf player in the world right now" was being answered from
+   * a model with no idea what year it was. A qualifier names no subject, so
+   * this covers rankings, prices, office holders, releases and a country's state
+   * without a topic list — and the ASK shape plus the remark guard keep a
+   * statement ("prices are crazy these days") in conversation.
+   */
+  const freshQuestion =
+    !remark && FRESHNESS_QUALIFIER.test(userText) && FACT_REQUEST_SHAPE.test(userText);
+
   if (
     !explicitAsk &&
     !factQuestion &&
     !eventQuestion &&
     !timeQuestion &&
+    !freshQuestion &&
     !banglaFact &&
     !banglaTime
   ) {
@@ -853,7 +953,7 @@ export interface TurnRoute {
   /** LIVE only: which honest fallback line a failed lookup earns. */
   lookupKind: LiveLookupKind | null;
   /** Why the decision was made — diagnostics and tests, never spoken. */
-  reason: "policy" | "intent" | "followup" | "guarded-live" | "default";
+  reason: "policy" | "intent" | "followup" | "guarded-live" | "semantic" | "default";
 }
 
 /**
@@ -1071,8 +1171,18 @@ function foldForOpenerMatch(text: string): string {
  * rewrite). Pure, deterministic and side-effect free, so it is directly
  * testable and cannot touch the network.
  */
-export function isSimpleChatTurn(text: string): boolean {
-  const trimmed = text.trim();
+/**
+ * A conversational lead-in stuck in front of an otherwise ordinary turn.
+ *
+ * "I said, how are you?", "again — tell me a joke", "please, how are you?" are
+ * the same turn with a repeat or a bit of impatience on the front. Stripping it
+ * lets the request itself be classified, so a greeting does not get routed
+ * through the meaning model just because it was asked twice.
+ */
+const CONVERSATIONAL_LEAD_IN =
+  /^\s*(?:i\s+said|i\s+already\s+said|again|please|just|ok(?:ay)?|so|but|and|hey|honestly|come\s+on)[,\s]+/i;
+
+export function isSimpleChatTurn(text: string): boolean {  const trimmed = text.trim();
 
   if (trimmed.length < 2 || trimmed.length > SIMPLE_CHAT_MAX_CHARS) {
     return false;
@@ -1097,6 +1207,20 @@ export function isSimpleChatTurn(text: string): boolean {
     return false;
   }
 
+  /*
+   * A REPEATED turn is still the turn it repeats.
+   *
+   * "I said, how are you?" is a greeting with a complaint stuck on the front.
+   * Tested whole, the opener test failed, the turn was not simple, the meaning
+   * router was fired, and a greeting paid a 6 s model round trip to be answered
+   * in one sentence. Dropping a leading conversational lead-in lets the actual
+   * request be judged — this is a SHAPE rule about how people talk, not a list
+   * of what they talk about.
+   */
+  const unfilled = foldForOpenerMatch(
+    trimmed.replace(CONVERSATIONAL_LEAD_IN, "").trim() || trimmed
+  );
+
   const folded = foldForOpenerMatch(trimmed);
 
   if (folded.length === 0) {
@@ -1104,7 +1228,12 @@ export function isSimpleChatTurn(text: string): boolean {
   }
 
   for (const opener of SIMPLE_CHAT_OPENERS) {
-    if (folded === opener || folded.startsWith(`${opener} `)) {
+    if (
+      folded === opener ||
+      folded.startsWith(`${opener} `) ||
+      unfilled === opener ||
+      unfilled.startsWith(`${opener} `)
+    ) {
       return true;
     }
   }
@@ -1135,13 +1264,14 @@ export function containsCapabilityLeak(text: string): boolean {
 }
 
 /**
- * Live turns cap the SERP retry at THREE attempts inside the shared deadline.
+ * Live turns cap the SERP retry at TWO attempts inside the shared deadline.
  *
- * The provider's own default is three (reject → backoff → reject → backoff →
- * try); a deterministic LIVE turn knows its query is right, so a third attempt
- * gives a flaky gateway one more chance before the honest line.
+ * The retry exists ONLY for the fast failure — a gateway reject, which returns
+ * in ~3.5 s and often succeeds on the second try. A timeout is never retried
+ * (it has already spent the whole budget), and two consecutive timeouts trip a
+ * process-local circuit breaker that skips the lookup entirely for a minute.
  */
-const LIVE_MAX_SEARCH_ATTEMPTS = 3;
+const LIVE_MAX_SEARCH_ATTEMPTS = 2;
 
 /** What this live lookup was actually waiting on. */
 type LiveLookupKind = "time" | "weather" | "search";
@@ -1207,17 +1337,43 @@ function isClockTurn(userText: string, searchQuery: string | null): boolean {
  *
  * One helper so the reason is chosen in exactly one place — used both when a
  * lookup ran and returned nothing, and when there was nothing to look up with.
+ *
+ * PER-TURN BY CONSTRUCTION: both arguments are this turn's own text and this
+ * turn's own resolved query, so the honest line can never inherit a previous
+ * turn's subject.
+ *
+ * The weather test is word-bounded on purpose. An unanchored substring matched
+ * "rain" inside "Ukraine", "brain", "train" and "constraint", which handed a
+ * non-weather turn the weather-specific refusal — a confidently wrong line.
  */
 function lookupKindFor(userText: string, searchQuery: string): LiveLookupKind {
   if (isClockTurn(userText, searchQuery)) {
     return "time";
   }
 
-  return /weather|forecast|temperature|rain|degree/i.test(
+  return /\b(?:weather|forecast|temperature|rain|raining|degree|degrees|hot|cold|humid)\b/i.test(
     `${searchQuery} ${userText}`
   )
     ? "weather"
     : "search";
+}
+
+/**
+ * The honest line's class, decided from THIS TURN'S OWN WORDS ONLY.
+ *
+ * Used by the marker path, where the search query is something the MODEL wrote
+ * rather than something the person asked. Reading the model's query here is how
+ * "how are you?" was answered with "I can't check the live weather right now":
+ * the model had just emitted a weather query for a different, earlier turn, and
+ * that query decided this turn's refusal.
+ *
+ * So the marker may still be obeyed — it is what stops a from-memory answer —
+ * but it can never choose a SUBJECT for the refusal. If the person's own words
+ * are about weather, they get the weather line; if they are about the clock,
+ * the clock line; otherwise the generic one, which is true of every subject.
+ */
+function honestFallbackKindFor(userText: string): LiveLookupKind {
+  return lookupKindFor(userText, "");
 }
 
 function toContents(
@@ -1450,7 +1606,7 @@ export async function stageRespond(
    * is where the 12 s draft + 13 s search + 12 s second synthesis worst case
    * and the "answered from memory" bug both came from.
    */
-  const route = routeTurn(userText, history);
+  let route = routeTurn(userText, history);
 
   if (route.kind === "block") {
     return {
@@ -1463,6 +1619,7 @@ export async function stageRespond(
 
   /*
    * THE FAST LANE FLAG, decided once and reused below.
+
    *
    * A simple-chat turn does not need the assist (it would answer `SKIP`) and
    * does not need the anti-echo rewording (the reply is short, fresh and
@@ -1492,16 +1649,111 @@ export async function stageRespond(
   ];
 
   /*
+   * THE MEANING-BASED ROUTER — coverage the regexes cannot have.
+   *
+   * The deterministic router above is an ALLOWLIST of shapes, so a genuinely
+   * live question about a subject nobody wrote a pattern for was answered from
+   * memory — the one failure this pipeline must never have. This asks a fast
+   * model what the turn MEANS instead, in any language, and may only PROMOTE
+   * this turn to LIVE.
+   *
+   * It is fired HERE, in the same tick as the main model and the assist, and
+   * settled below — so an ordinary CHAT turn completes at
+   * max(main, assist, router) and pays NO extra latency for it. A deterministic
+   * LIVE turn never fires it at all: the search path below is already the
+   * fastest route for a turn whose intent is already known. The safety gate has
+   * already returned, so this can never promote a BLOCK.
+   *
+   * A SIMPLE-CHAT TURN SKIPS IT ENTIRELY. "Hi", "how are you?", "tell me a
+   * joke" and "I'm sad" are decided deterministically and can never be live, so
+   * asking a model about them bought nothing and cost a third concurrent call
+   * on the exact latency budget that must not slip. Measured: this call ranges
+   * from 0.9 s to a 20 s total failure, so keeping it off the greeting path
+   * removes the flakiest call from the most frequent turn.
+   */
+  const skipSemanticRouter = route.kind === "live" || isSimpleChatTurn(userText);
+
+  const semanticRoutePromise = skipSemanticRouter
+    ? Promise.resolve(null)
+    : classifyTurnSemantics(userText, history);
+
+  /*
+   * Steps 2 and 3 in flight together, WITH the router. The assist is capped at
+   * 800 ms and the router at 1200 ms, so a turn completes at
+   * max(main, assist, router) — never an open-ended wait, and never a
+   * sequential hop added to ordinary conversation.
+   *
+   * Simple chat skips the assist entirely: the contract literally tells it to
+   * answer `SKIP` for greetings, jokes and feelings, so the round trip could
+   * only ever add latency — and a `Promise.resolve(null)` keeps the concurrent
+   * shape of the branches identical.
+   *
+   * A deterministic LIVE turn never reaches this call — its reply is written
+   * from the search results above (or fails honestly before any model ran).
+   */
+  const [mainModelReply, draft, semanticRoute] =
+    route.kind === "live"
+      ? ([null, null, null] as const)
+      : await Promise.all([
+          groqChat({
+            model: GROQ_MODELS.main,
+            messages,
+            temperature: 0.8,
+            maxOutputTokens: BRAIN_TOKEN_BUDGETS.respond,
+            timeoutMs: BRAIN_TIMEOUTS_MS.respond,
+          }),
+          simpleChat ? Promise.resolve(null) : stageFastAssist(userText, history),
+          semanticRoutePromise,
+        ]);
+  assistDraft = draft;
+
+  /*
+   * SETTLE THE ROUTER, then let it PROMOTE — never demote.
+   *
+   * The main model, the assist and the router were fired in one tick, so a
+   * CHAT turn has already paid max(main, assist, router) by the time this runs
+   * and the promotion costs nothing extra. A confident `live` carrying a usable
+   * query promotes the turn and DISCARDS the from-memory draft, which is the
+   * whole point: a question that needs fresh facts must never be answered from
+   * a stale model, so the draft is thrown away rather than preferred. Every
+   * other outcome — chat, missing field, bad route, timeout, no key — leaves
+   * the deterministic route untouched.
+   */
+  let mainReply: string | null = mainModelReply;
+
+  if (
+    semanticRoute !== null &&
+    semanticRoute.confident &&
+    semanticRoute.kind === "live" &&
+    semanticRoute.query !== null
+  ) {
+    route = {
+      kind: "live",
+      verdict: route.verdict,
+      query: semanticRoute.query,
+      lookupKind: lookupKindFor(userText, semanticRoute.query),
+      reason: "semantic",
+    };
+    // The ungrounded draft must not survive into the marker/assist tail below.
+    mainReply = null;
+    assistDraft = null;
+  }
+
+  /*
    * ── LIVE ────────────────────────────────────────────────────────────────
    * intent → Bright Data search → grounded synthesis. The responder is NOT
-   * asked first: a model asked "what's the weather in Dhaka?" before the
-   * lookup answers from memory — and eats 12 s doing it — so for this branch
-   * no model runs until snippets are in hand.
+   * used for this: a model asked "what's the weather in Dhaka?" before the
+   * lookup answers from memory, so for this branch the draft computed above is
+   * DISCARDED and the reply is written only from real snippets.
    *
-   * HONEST FAILURE. If the lookup produces nothing (unconfigured, provider
-   * error, genuinely empty), memory is BANNED outright: no model call, no
-   * assist draft, one honest canned line in the locked language. There is no
-   * path from this branch to a fabricated current fact.
+   * HONEST FAILURE. If the lookup produces nothing — unconfigured, provider
+   * error, genuinely empty, or the circuit breaker open — memory stays BANNED:
+   * no from-memory answer, no assist draft, one honest canned line in the
+   * locked language. There is no path from this branch to a fabricated current
+   * fact.
+   *
+   * ORDERING: this runs AFTER the router's promotion above, so a turn the
+   * meaning-based router recognised still reaches the search engine.
    */
   if (route.kind === "live" && route.query !== null) {
     const lookupKind = route.lookupKind ?? "search";
@@ -1524,9 +1776,8 @@ export async function stageRespond(
       onProgress?.({ phase: "searching" });
       const outcome = await serpSearchDetailed(route.query, BRAIN_TIMEOUTS_MS.search, {
         lookupKind,
-        // Deterministic LIVE gets a bounded retry: two attempts inside the
-        // shared 13 s deadline, not three — a live turn should not burn its
-        // whole window on gateway rejects.
+        // A gateway reject is fast and worth one more try; a timeout is not
+        // retried at all, and two consecutive timeouts open the breaker.
         maxAttempts: LIVE_MAX_SEARCH_ATTEMPTS,
       });
       const results = outcome.kind === "ok" ? outcome.results : null;
@@ -1591,42 +1842,67 @@ export async function stageRespond(
 
         usedSearch = true;
 
-        if (isSpeakableReply(grounded) && !looksLikeRefusal(grounded)) {
-          reply = grounded;
+        /*
+         * TURN A RAW SYNTHESIS INTO SPEECH — three cases, one answer.
+         *
+         * Observed failure: a search that SUCCEEDED was answered with "I found
+         * something but couldn't put it into words just now — ask me once
+         * more?", which tells the person the lookup worked, throws away the
+         * answer, and blames them for asking. Three causes, three fixes:
+         *
+         *   1. The reply still carries a `[SEARCH: …]` marker. The system
+         *      prompt trains that marker, so the synthesiser occasionally emits
+         *      one even while holding the answer. The marker is a pipeline
+         *      instruction and must never be spoken — but the ANSWER around it
+         *      is perfectly good, so it is stripped and the rest is used.
+         *   2. The reply is empty. `gpt-oss-120b` reasons before it speaks, so
+         *      a long grounded prompt can exhaust its budget and return
+         *      nothing. One retry with headroom recovers the common case.
+         *   3. It really is unusable. Only here is the honest line spoken —
+         *      and it is the LAST resort, not the first.
+         */
+        let spoken = stripSearchMarker(grounded);
+        let source = grounded;
+
+        if (spoken === null || spoken.length === 0) {
+          // Case 2 — reasoning ate the budget. One retry, with room to finish.
+          const retry = await groqChat({
+            model: GROQ_MODELS.main,
+            messages: [
+              ...messages,
+              {
+                role: "user",
+                content: [
+                  LANGUAGE_DIRECTIVES[language],
+                  "Web search results (may be incomplete):",
+                  results,
+                  "",
+                  `The person said: "${userText}"`,
+                  "Answer in your own voice, in one to three short spoken",
+                  "sentences. Do not output any marker or bracket tag.",
+                  "Ground every current fact in these results alone.",
+                ].join("\n"),
+              },
+            ],
+            temperature: 0.5,
+            maxOutputTokens: BRAIN_TOKEN_BUDGETS.respond * 2,
+            timeoutMs: BRAIN_TIMEOUTS_MS.respond,
+          });
+
+          source = retry;
+          spoken = stripSearchMarker(retry);
+        }
+
+        if (spoken !== null && spoken.length > 0 && !looksLikeRefusal(spoken)) {
+          reply = spoken;
         } else {
-          // The lookup worked but the results could not be phrased — the
-          // short "found something" line, never a from-memory substitute.
+          // Case 3 — genuinely unusable. The honest line, and only this line.
           reply = synthesisFailedReply(language);
+          void source;
         }
       }
     }
   }
-
-  // Steps 2 and 3 in flight together. The assist is capped at 800 ms, so a turn
-  // completes at max(main, assist) — a bounded fraction of a second, never an
-  // open-ended wait on Google.
-  //
-  // Simple chat skips the assist entirely: the contract literally tells it to
-  // answer `SKIP` for greetings, jokes and feelings, so the round trip could
-  // only ever add latency — and a `Promise.resolve(null)` keeps the concurrent
-  // shape of the two branches identical.
-  //
-  // A LIVE turn never reaches this call at all — its reply was already written
-  // from the search results above (or failed honestly before any model ran).
-  const [mainReply, draft] =
-    route.kind === "live"
-      ? ([null, null] as const)
-      : await Promise.all([
-          groqChat({
-            model: GROQ_MODELS.main,
-            messages,
-            temperature: 0.8,
-            maxOutputTokens: BRAIN_TOKEN_BUDGETS.respond,
-            timeoutMs: BRAIN_TIMEOUTS_MS.respond,
-          }),
-          simpleChat ? Promise.resolve(null) : stageFastAssist(userText, history),
-        ]);
-  assistDraft = draft;
 
   /*
    * ROOT CAUSE OF THE "Dhaka" DEAD-END, FIXED HERE.
@@ -1650,8 +1926,29 @@ export async function stageRespond(
    * `ambiguous` route). When a marker turn produces NOTHING, memory is banned
    * and the turn gets one honest line in the locked language — no invented
    * weather, news, score, price or time.
+   *
+   * ── WHY A SIMPLE-CHAT TURN CANNOT ARM IT ──────────────────────────────────
+   *
+   * Observed failure: after ONE failed weather lookup, every following turn —
+   * "how are you?", "I said, how are you?" — was answered with "I can't check
+   * the live weather right now". Two causes, both here:
+   *
+   *   1. The marker is a PATTERN IN THE HISTORY. Once `[SEARCH: …]` has been
+   *      used, the responder keeps emitting it on turns that need no facts, and
+   *      every one of those burns a search. A greeting is never a live ask —
+   *      `isSimpleChatTurn` already returns false for anything the deterministic
+   *      router considers live — so for those turns the marker is discarded
+   *      rather than obeyed.
+   *   2. `lookupKindFor(userText, markerQuery)` reads the MARKER's text, not
+   *      this turn's, so a "how are you?" turn inherited "weather" from the
+   *      query the model had just written and was handed the weather refusal.
+   *      The honest line is now chosen from THIS turn's own words below.
+   *
+   * A turn that is NOT simple chat keeps the marker, which is what stops
+   * "what is the current world condition" from being answered from memory.
    */
-  const markerQuery = rawMain === null ? null : findSearchQuery(rawMain);
+  const markerQuery =
+    rawMain === null || isSimpleChatTurn(userText) ? null : findSearchQuery(rawMain);
 
   if (markerQuery !== null) {
     /*
@@ -1667,7 +1964,7 @@ export async function stageRespond(
      */
     let results: string | null = null;
     let outcome: SerpResult | null = null;
-    const markerLookupKind = lookupKindFor(userText, markerQuery);
+    const markerLookupKind = honestFallbackKindFor(userText);
 
     if (isBrightDataConfigured()) {
       onProgress?.({ phase: "searching" });
@@ -1792,7 +2089,16 @@ export async function stageRespond(
           : lookupUnavailableReply(language, markerLookupKind);
     }
   } else if (route.kind !== "live") {
-    reply = isSpeakableReply(rawMain) ? rawMain : null;
+    /*
+     * The marker is IGNORED above for a simple-chat turn, but it may still be
+     * PRESENT in the text. `isSpeakableReply` rejects any reply containing one,
+     * so passing `rawMain` straight through discarded the answer and left
+     * `reply` null — which throws below and replaces a good greeting with the
+     * generic "couldn't think that through" line. The marker is a pipeline
+     * instruction, so it is removed and the sentence around it is spoken.
+     */
+    const chatText = stripSearchMarker(rawMain);
+    reply = chatText !== null && !isCannedReply(chatText) ? chatText : null;
 
     /*
      * Rescue. The input guard already cleared this message, so a refusal here

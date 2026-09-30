@@ -70,6 +70,18 @@ const SILENCE_TIMEOUT_MS = 10_000;
 const CONNECT_TIMEOUT_MS = 8_000;
 
 /**
+ * How long the mic stays deaf after Elara finishes speaking.
+ *
+ * `speak()` resolving ends the utterance, not the room: the tail of her own
+ * voice keeps arriving for a few hundred milliseconds, and reopening the audio
+ * gate on that tail is what produced a phantom user turn nobody said. Held
+ * closed, with the partial frame discarded, so only the PERSON's next words can
+ * become a turn. Immeasurable next to a conversational gap, and it costs
+ * nothing while Elara is silent because the mic is capturing the whole time.
+ */
+const POST_SPEECH_ECHO_SETTLE_MS = 400;
+
+/**
  * How long a PREFETCHED token stays usable.
  *
  * The server mints tokens with a 60 s redemption window, and a redeemed token
@@ -1032,6 +1044,32 @@ export function useVoiceSession(): UseVoiceSessionResult {
         if (turnEpoch !== sessionEpochRef.current || !activeRef.current) {
           return;
         }
+
+        /*
+         * THE ECHO SETTLE.
+         *
+         * `speak()` resolving means the utterance ENDED, not that the room did.
+         * The speaker's tail keeps feeding the microphone for a few hundred
+         * milliseconds afterwards, and the `onChunk` gate only drops audio while
+         * the status is `speaking` — so that tail was streamed the instant the
+         * status flipped back, transcribed, and appeared as a PHANTOM USER TURN
+         * nobody said ("Come on." out of nowhere).
+         *
+         * So: hold the non-speaking state briefly, throw away whatever partial
+         * frame the tail produced, and only then reopen the gate. The person
+         * cannot notice a few hundred milliseconds, and the mic is still
+         * capturing throughout — nothing is dropped from THEIR speech, only
+         * from Elara's own voice.
+         */
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, POST_SPEECH_ECHO_SETTLE_MS);
+        });
+
+        if (turnEpoch !== sessionEpochRef.current || !activeRef.current) {
+          return;
+        }
+
+        discardPartialFrame();
 
         // Resume listening so the person can speak the next turn without
         // tapping the orb again. The 10s silence timeout settles the session

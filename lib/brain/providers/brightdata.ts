@@ -14,11 +14,59 @@ import { getBrightDataSerpToken, getBrightDataSerpZone } from "@/lib/brain/env";
 const BRIGHT_DATA_REQUEST_URL = "https://api.brightdata.com/request";
 const MAX_RESULTS = 5;
 
-/** Outcome of a SERP attempt - enough for the caller to pick an honest line. */
+/* ──────────────────────────────────────────────────────────────────────────
+   CIRCUIT BREAKER — process-local, deliberately simple.
+   ──────────────────────────────────────────────────────────────────────────
+   The gateway is demonstrably flaky (measured: ~1 in 4 attempts hangs for the
+   full budget). Without a breaker every LIVE turn during an outage pays the
+   whole timeout before the honest line — which is exactly the "dead air" the
+   voice loop cannot afford. After two consecutive TIMEOUTS the breaker opens
+   for a minute and lookups are skipped outright, so the honest line is spoken
+   immediately instead of after a silent wait.
+
+   Only TIMEOUTS count. A gateway reject is fast and often succeeds on the next
+   try, so failing closed on those would disable search for transient blips. */
+const BREAKER_TIMEOUT_MS = 60_000;
+const BREAKER_THRESHOLD = 2;
+
+let consecutiveTimeouts = 0;
+let breakerOpenUntil = 0;
+
+/** True while the breaker is open; also clears it once the window has passed. */
+function breakerIsOpen(): boolean {
+  if (breakerOpenUntil === 0) {
+    return false;
+  }
+
+  if (Date.now() >= breakerOpenUntil) {
+    breakerOpenUntil = 0;
+    consecutiveTimeouts = 0;
+    return false;
+  }
+
+  return true;
+}
+
+/** Record one outcome: any success or non-timeout fault resets the counter. */
+function recordBreakerOutcome(wasTimeout: boolean): void {
+  if (!wasTimeout) {
+    consecutiveTimeouts = 0;
+    return;
+  }
+
+  consecutiveTimeouts += 1;
+
+  if (consecutiveTimeouts >= BREAKER_THRESHOLD) {
+    breakerOpenUntil = Date.now() + BREAKER_TIMEOUT_MS;
+  }
+}
+
+/** Outcome of an attempt: the SERP worked. */
 export type SerpResult =
   | { kind: "ok"; results: string }
   | { kind: "empty" }
   | { kind: "unavailable" }
+  | { kind: "breaker-open" }
   | { kind: "error"; status: number };
 
 /**
@@ -124,6 +172,19 @@ export async function serpSearchDetailed(
     return { kind: "unavailable" };
   }
 
+  /*
+   * BREAKER CHECK — before any network call, and before the deadline starts.
+   *
+   * Skipping here is what turns a provider outage from "13 s of dead air on
+   * every live turn" into "the honest line, immediately". The caller still
+   * speaks a truthful refusal: a skipped lookup bans memory exactly like a
+   * failed one, so nothing is ever invented to fill the gap.
+   */
+  if (breakerIsOpen()) {
+    log({ attempted: false, reason: "breaker-open", timeouts: consecutiveTimeouts });
+    return { kind: "breaker-open" };
+  }
+
   // No `num` parameter: the zone flags it as unacceptable and strips it
   // (`x-brd-serp-warn`), and the MAX_RESULTS slice below caps the list anyway.
   const searchUrl =
@@ -145,16 +206,20 @@ export async function serpSearchDetailed(
    * a real empty set) still returns immediately. The log carries only
    * statuses, outcome, attempt count and timing — never query or body.
    */
-const backoffMs = [300, 700, 1500];
-   let lastHttp = 0;
-   let lastBrd: number | null = null;
-   /** Class of the most recent failure — the final log reports it as `outcome`
-    *  so the vocabulary stays ok | empty | gateway-reject | timeout | error. */
-   let lastFault: "timeout" | "error" = "error";
+  const backoffMs = [300, 700];
+  let lastHttp = 0;
+  let lastBrd: number | null = null;
+  /** Class of the most recent failure — the final log reports it as `outcome`
+   *  so the vocabulary stays ok | empty | gateway-reject | timeout | error. */
+  let lastFault: "timeout" | "error" = "error";
+  /** Set once an attempt has burned the whole budget on a hang. */
+  let budgetSpent = false;
 
-   for (let attempt = 0; ; attempt += 1) {
-     // Attempt cap: maxAttempts (LIVE passes 3) rejects are the answer.
-     if (attempt >= maxAttempts) {
+  for (let attempt = 0; ; attempt += 1) {
+    // Attempt cap, and the hard rule that removes the dead air: a TIMEOUT has
+    // already consumed the entire shared deadline, so there is nothing left to
+    // retry into. Only a FAST gateway reject is worth another attempt.
+    if (attempt >= maxAttempts || budgetSpent) {
       break;
     }
 
@@ -280,6 +345,7 @@ const backoffMs = [300, 700, 1500];
           parser,
           outcome: "empty",
         });
+        recordBreakerOutcome(false);
         return { kind: "empty" };
       }
 
@@ -293,6 +359,7 @@ const backoffMs = [300, 700, 1500];
         outcome: "ok",
         results: organic.length,
       });
+      recordBreakerOutcome(false);
       return {
         kind: "ok",
         results: organic
@@ -307,6 +374,20 @@ const backoffMs = [300, 700, 1500];
       const errorClass =
         name === "TimeoutError" || name === "AbortError" ? "timeout" : "network";
       lastFault = errorClass === "timeout" ? "timeout" : "error";
+
+      /*
+       * THE DEAD-AIR RULE.
+       *
+       * A timeout means the fetch consumed the remainder of the shared budget,
+       * so there is no time left for a second attempt — and retrying anyway was
+       * the 13 s of silence before the honest line. Stop the loop here and let
+       * the breaker decide whether the NEXT turn even tries.
+       */
+      if (lastFault === "timeout") {
+        budgetSpent = true;
+      }
+
+      recordBreakerOutcome(lastFault === "timeout");
       log({ attempted: true, ms, attempt, outcome: lastFault, errorClass });
     }
   }

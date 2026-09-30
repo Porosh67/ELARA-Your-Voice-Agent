@@ -11,6 +11,8 @@ import {
 } from "@/lib/brain/stages/respond";
 import {
   POLICY_INJECTION_REPLY,
+  SEARCH_SYNTHESIS_FAILED_REPLY,
+  SEARCH_UNAVAILABLE_REPLY,
   WEATHER_UNAVAILABLE_REPLY,
   isCannedReply,
 } from "@/lib/brain/types";
@@ -81,6 +83,21 @@ function serpPayloadFor(query: string): unknown {
   };
 }
 
+/**
+ * When set, the GROUNDED synthesis returns this string instead of the default.
+ * Used to reproduce the two synthesis failures exactly: a stray `[SEARCH: …]`
+ * marker beside a good answer, and an empty reply from exhausted reasoning.
+ */
+let groundedOverride: string | null = null;
+
+/**
+ * Simulates the real recovery case: the FIRST grounded call comes back empty
+ * because reasoning ate the budget, and only the retry produces text. A single
+ * static override cannot express that, so the count is tracked instead.
+ */
+let groundedEmptyThenReply = false;
+let groundedCallCount = 0;
+
 function groqReplyFor(body: Record<string, unknown>): string {
   const messages = body.messages as { content?: unknown }[] | undefined;
   const text = (messages ?? [])
@@ -89,7 +106,17 @@ function groqReplyFor(body: Record<string, unknown>): string {
     )
     .join("\n");
 
-  return text.includes("Web search results") ? groundedReply : mainReply;
+  if (text.includes("Web search results")) {
+    groundedCallCount += 1;
+
+    if (groundedEmptyThenReply) {
+      return groundedCallCount === 1 ? "" : groundedReply;
+    }
+
+    return groundedOverride ?? groundedReply;
+  }
+
+  return mainReply;
 }
 
 async function mockFetch(
@@ -695,6 +722,124 @@ async function main(): Promise<void> {
     );
 
     (globalThis as { fetch?: typeof fetch }).fetch = originalFetch;
+  }
+
+  /*
+   * GROUNDED SYNTHESIS RECOVERY.
+   *
+   * A search that worked was answered with "I found something but couldn't put
+   * it into words just now" because the synthesiser emitted a `[SEARCH: …]`
+   * marker next to a perfectly good answer, and the whole reply was discarded.
+   * The marker must be stripped and the answer spoken.
+   */
+  {
+    groundedOverride =
+      "[SEARCH: current condition in Bangladesh] It's warm and humid in Dhaka right now, with showers passing through.";
+    resetCalls();
+    serpMode = "ok";
+    const result = await stageRespond("What's the weather in Dhaka?", emptyHistory);
+    check(
+      "grounded reply keeps the answer around a stray marker",
+      result.reply.includes("warm and humid") && !/\[search:/i.test(result.reply),
+      result.reply
+    );
+    groundedOverride = null;
+  }
+
+  /*
+   * AN EMPTY SYNTHESIS IS RETRIED, NOT ABANDONED.
+   *
+   * `gpt-oss-120b` reasons before it speaks, so a long grounded prompt can
+   * exhaust its budget and return nothing. The first reply empty plus a good
+   * retry must speak the retry.
+   */
+  {
+    groundedEmptyThenReply = true;
+    groundedCallCount = 0;
+    resetCalls();
+    serpMode = "ok";
+    const result = await stageRespond("What's the weather in Dhaka?", emptyHistory);
+    check(
+      "empty synthesis is retried and the retry is spoken",
+      result.reply === groundedReply,
+      result.reply
+    );
+    check(
+      "empty synthesis really did cost a second call",
+      groundedCallCount === 2,
+      String(groundedCallCount)
+    );
+    groundedEmptyThenReply = false;
+    groundedCallCount = 0;
+  }
+
+  /*
+   * A SYNTHESIS THAT IS EMPTY BOTH TIMES MUST STAY HONEST.
+   *
+   * The recovery retry is a rescue, not a licence to invent. If nothing usable
+   * comes back, the honest line is the only correct reply.
+   */
+  {
+    groundedOverride = "";
+    resetCalls();
+    serpMode = "ok";
+    const result = await stageRespond("What's the weather in Dhaka?", emptyHistory);
+    check(
+      "unrecoverable synthesis speaks the honest line",
+      result.reply === SEARCH_SYNTHESIS_FAILED_REPLY,
+      result.reply
+    );
+    groundedOverride = null;
+  }
+
+  /*
+   * A TURN THAT IS ONLY ABOUT SEARCHING IS NOT A SEARCH REQUEST.
+   *
+   * "I can't understand why you sometimes can live search and sometimes not"
+   * armed a real lookup, because the bare word "search" matched the explicit
+   * verb class, and the assistant then answered a question about its own
+   * behaviour with a lookup failure.
+   */
+  {
+    resetCalls();
+    serpMode = "ok";
+    const metaTurn =
+      "I can't understand why you sometimes can live search and sometimes not. What's the problem?";
+    const route = routeTurn(metaTurn, emptyHistory);
+    check("meta search turn stays chat", route.kind !== "live", route.kind);
+
+    const result = await stageRespond(metaTurn, emptyHistory);
+    check("meta search turn never searches", serpCalls().length === 0);
+    check(
+      "meta search turn is answered as conversation",
+      result.reply !== SEARCH_UNAVAILABLE_REPLY &&
+        result.reply !== WEATHER_UNAVAILABLE_REPLY,
+      result.reply
+    );
+  }
+
+  /*
+   * A SIMPLE-CHAT TURN CANNOT ARM THE MODEL'S SEARCH MARKER.
+   *
+   * Once `[SEARCH: …]` appears in the history the responder keeps imitating the
+   * pattern, and every greeting after it burned a lookup and was handed a
+   * weather refusal. The marker is a pipeline instruction, so a greeting must
+   * not obey it.
+   */
+  {
+    mainReply = "[SEARCH: weather in Tokyo] I'm doing well, thanks!";
+    resetCalls();
+    serpMode = "ok";
+    const result = await stageRespond("How are you?", emptyHistory);
+    check("greeting ignores a stray marker", serpCalls().length === 0);
+    check(
+      "greeting is not handed a lookup failure",
+      result.reply !== WEATHER_UNAVAILABLE_REPLY &&
+        result.reply !== SEARCH_UNAVAILABLE_REPLY,
+      result.reply
+    );
+    check("greeting speaks a real answer", result.reply.includes("well"), result.reply);
+    mainReply = "Hey there — good to hear you. What's on your mind today?";
   }
 
   /* Parser: every accepted shape, verified against a canned line set. */
