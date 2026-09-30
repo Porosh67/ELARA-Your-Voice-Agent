@@ -11,7 +11,7 @@ import { VoiceOrb } from "@/components/landing/voice-orb";
 const MICRO_PROOFS = [
   "No data resale",
   "Encrypted in transit",
-  "40+ languages",
+  "20 languages",
 ] as const;
 
 const containerVariants: Variants = {

@@ -142,19 +142,19 @@ export const BRAIN_TIMEOUTS_MS = {
   router: 6000,
   respond: 12000,
   /**
-   * Bright Data launches a real browser for one SERP fetch, and measured on
-   * this account a successful request lands at 2.4–6.7 s. A hung request — the
-   * gateway is flaky, roughly 1 attempt in 4 — otherwise burns the whole
-   * budget in silence, which is dead air in a voice loop.
+   * Bright Data launches a real browser for one SERP fetch, and on a successful
+   * request this regularly needs more than 6.5 s — measured landings span
+   * 2.4 s to well past 10 s on a warm zone, and the browser session itself
+   * competes for the same machine the voice loop is running on.
    *
-   * 6.5 s is the ONE shared budget for a whole lookup: backoff waits and
+   * 20 s is the ONE shared budget for a whole lookup: backoff waits and
    * per-attempt aborts are computed from it, so a gateway-reject retry can
-   * never extend a turn past it. A timeout is never retried at all (see
-   * `serpSearchDetailed`), and two consecutive timeouts open a process-local
-   * circuit breaker for a minute so the honest line is spoken immediately
-   * instead of after a silent wait.
+   * never extend a turn past it. A timeout is still never retried (see
+   * `serpSearchDetailed`), and two consecutive timeouts still open a
+   * process-local circuit breaker for a minute so the honest line is spoken
+   * immediately instead of after a silent wait.
    */
-  search: 6500,
+  search: 20000,
   /**
    * Step 2's hard ceiling — locked at 800 ms.
    *

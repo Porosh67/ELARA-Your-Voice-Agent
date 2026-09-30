@@ -2,7 +2,7 @@ import { Stat } from "@/components/ui/stat";
 
 const STATS = [
   { value: 300, prefix: "<", suffix: "ms", label: "Response latency" },
-  { value: 40, suffix: "+", label: "Languages supported" },
+  { value: 20, label: "Languages supported" },
   { value: 0, label: "Data ever sold" },
 ] as const;
 

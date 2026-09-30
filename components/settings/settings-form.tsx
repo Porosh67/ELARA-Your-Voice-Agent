@@ -485,12 +485,12 @@ export function SettingsForm({
                 void patchSetting("memory_enabled", !settings.memory_enabled)
               }
               disabled={pendingField === "memory_enabled"}
-              className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
+              className={`relative h-6 w-11 shrink-0 overflow-hidden rounded-full transition-colors ${
                 settings.memory_enabled ? "bg-primary" : "bg-foreground/20"
               } disabled:opacity-60`}
             >
               <span
-                className={`absolute top-1 h-4 w-4 rounded-full bg-white transition-transform ${
+                className={`absolute left-0 top-1 block h-4 w-4 rounded-full bg-white transition-transform ${
                   settings.memory_enabled ? "translate-x-6" : "translate-x-1"
                 }`}
               />
