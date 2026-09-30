@@ -191,10 +191,33 @@ export async function signUp(
 
 export async function signInWithGoogle(): Promise<void> {
   const supabase = await createClient();
+
+  /*
+   * GOOGLE CONSENT + ACCOUNT PICKER — forced on every attempt.
+   *
+   * Without `prompt`, Google skips the consent screen entirely once it has seen
+   * the app before: the user picks a tile and is signed straight in, with no
+   * "Elara wants to access your account" step. That is both a worse experience
+   * and a weaker one — the person is never told what is being shared, and there
+   * is no chance to notice the app is asking for the wrong thing.
+   *
+   * `consent`  forces the permissions screen every time.
+   * `select_account` forces the account chooser, so signing in as a different
+   *   person is possible without first signing the current one out — which is
+   *   the single most common "I can't log in as my other account" report.
+   * `access_type: 'offline'` asks for a refresh token, so a Google session can
+   *   outlive the access token rather than dropping the user out mid-conversation.
+   *
+   * Both values are fixed strings written here, never taken from user input.
+   */
   const { data, error } = await supabase.auth.signInWithOAuth({
     provider: "google",
     options: {
       redirectTo: `${getSiteOrigin()}/auth/callback`,
+      queryParams: {
+        prompt: "consent select_account",
+        access_type: "offline",
+      },
     },
   });
 

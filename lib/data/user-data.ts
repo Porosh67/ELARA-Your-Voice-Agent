@@ -1,6 +1,7 @@
 import "server-only";
 
 import { createClient } from "@/lib/supabase/server";
+import { buildProfileGapPatch, type GapUser } from "@/lib/data/profile-gaps";
 import type { Conversation, Profile, UserSettings } from "@/types/database";
 
 /**
@@ -34,10 +35,51 @@ import type { Conversation, Profile, UserSettings } from "@/types/database";
  */
 
 /** The subset of a user object this module needs. */
-export interface DataLayerUser {
-  id: string;
-  email?: string | null;
-  is_anonymous?: boolean;
+export type DataLayerUser = GapUser;
+
+export async function fillProfileGaps(
+  user: DataLayerUser,
+  profile: Profile | null
+): Promise<Profile | null> {
+  if (profile === null) {
+    return null;
+  }
+
+  const patch = buildProfileGapPatch(user, profile);
+
+  if (Object.keys(patch).length === 0) {
+    return profile;
+  }
+
+  try {
+    const supabase = await createClient();
+
+    const { data, error } = await supabase
+      .from("profiles")
+      // Scoped by id, and RLS scopes it again — this cannot touch another row.
+      .update(patch)
+      .eq("id", user.id)
+      .select("*")
+      .single<Profile>();
+
+    if (error) {
+      /*
+       * A unique violation here means somebody already owns the derived
+       * username. That is expected and harmless: the person simply keeps an
+       * empty username and chooses a different handle in Settings. Anything else
+       * is logged, never thrown — a profile nicety must not break a page.
+       */
+      if (error.code !== "23505") {
+        console.error("[data] profile gap-fill failed:", error.code);
+      }
+
+      return profile;
+    }
+
+    return data ?? profile;
+  } catch {
+    return profile;
+  }
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -105,10 +147,19 @@ export async function ensureUserRows(
       .maybeSingle<UserSettings>(),
   ]);
 
-  return {
-    profile: profileResult.data ?? null,
-    settings: settingsResult.data ?? null,
-  };
+  /*
+   * FILL GAPS, last.
+   *
+   * The insert above can only create a row, and the reads above can only see
+   * one. Neither repairs a row that exists but is missing a name or a username
+   * — which is exactly the state a Google or email account lands in when the
+   * signup trigger saw no metadata. This is the step that makes Settings show a
+   * real Full name and a real Username for an account that has them, without
+   * ever overwriting a value the person chose.
+   */
+  const profile = await fillProfileGaps(user, profileResult.data ?? null);
+
+  return { profile, settings: settingsResult.data ?? null };
 }
 
 /** Read settings, self-healing the row if it is missing. Never throws. */
