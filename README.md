@@ -103,3 +103,8 @@ Requires `ASSEMBLYAI_API_KEY` in `.env.local` (server-only — the browser only 
 ---
 
 **Built for the AssemblyAI Hackathon** — real-time streaming STT, deterministic live search routing, and a locked 5-stage brain pipeline.
+## License
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
+Copyright (c) 2026 Porosh67. See [LICENSE](./LICENSE) for details.
