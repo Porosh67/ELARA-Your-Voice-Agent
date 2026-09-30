@@ -607,8 +607,13 @@ export function useVoiceSession(): UseVoiceSessionResult {
 
       let sampleRate: number;
       let token: string;
+      let usedPrefetchedToken = false;
 
       try {
+        const prefetched = tokenPrefetchRef.current;
+        if (prefetched !== null && Date.now() - prefetched.at <= TOKEN_PREFETCH_MAX_AGE_MS) {
+          usedPrefetchedToken = true;
+        }
         [sampleRate, token] = await Promise.all([
           recorder.start(),
           acquireToken(startup.signal),
@@ -654,6 +659,52 @@ export function useVoiceSession(): UseVoiceSessionResult {
           timeoutMs: CONNECT_TIMEOUT_MS,
         });
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isTokenExpired = errorMessage.includes("1008") || errorMessage.includes("may have expired");
+
+        // If we used a prefetched token and it was rejected (1008), retry ONCE with a fresh token.
+        if (usedPrefetchedToken && isTokenExpired && startupAbortRef.current === startup) {
+          // Clean up the failed attempt first.
+          stream.terminate();
+          if (streamRef.current === stream) {
+            streamRef.current = null;
+          }
+          recorder.stop();
+          if (recorderRef.current === recorder) {
+            recorderRef.current = null;
+          }
+
+          // Fetch a fresh token and retry the connection.
+          let retryStream: AssemblyAiStream | null = null;
+          try {
+            const freshToken = await acquireToken(startup.signal);
+            retryStream = new AssemblyAiStream();
+            streamRef.current = retryStream;
+
+            await retryStream.connect({
+              token: freshToken,
+              sampleRate,
+              speechModel,
+              callbacks: buildCallbacks(onError, epoch),
+              timeoutMs: CONNECT_TIMEOUT_MS,
+            });
+            return; // Success on retry
+          } catch {
+            // Retry failed — clean up and throw the original error.
+            if (startupAbortRef.current === startup) {
+              retryStream?.terminate();
+              if (streamRef.current === retryStream) {
+                streamRef.current = null;
+              }
+              recorder.stop();
+              if (recorderRef.current === recorder) {
+                recorderRef.current = null;
+              }
+            }
+            throw error; // Throw original token-expiry error
+          }
+        }
+
         /*
          * A Stop that landed mid-handshake has already torn this down through
          * its own refs, so this only cleans up after a genuine failure — and it

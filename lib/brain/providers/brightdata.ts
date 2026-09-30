@@ -145,17 +145,16 @@ export async function serpSearchDetailed(
    * a real empty set) still returns immediately. The log carries only
    * statuses, outcome, attempt count and timing — never query or body.
    */
-  const backoffMs = [300, 700];
-  let lastHttp = 0;
-  let lastBrd: number | null = null;
-  /** Class of the most recent failure — the final log reports it as `outcome`
-   *  so the vocabulary stays ok | empty | gateway-reject | timeout | error. */
-  let lastFault: "timeout" | "error" = "error";
+const backoffMs = [300, 700, 1500];
+   let lastHttp = 0;
+   let lastBrd: number | null = null;
+   /** Class of the most recent failure — the final log reports it as `outcome`
+    *  so the vocabulary stays ok | empty | gateway-reject | timeout | error. */
+   let lastFault: "timeout" | "error" = "error";
 
-  for (let attempt = 0; ; attempt += 1) {
-    // Attempt cap (LIVE passes 2): two rejects are the answer — do not burn
-    // the rest of the shared deadline on a third try before the honest line.
-    if (attempt >= maxAttempts) {
+   for (let attempt = 0; ; attempt += 1) {
+     // Attempt cap: maxAttempts (LIVE passes 3) rejects are the answer.
+     if (attempt >= maxAttempts) {
       break;
     }
 

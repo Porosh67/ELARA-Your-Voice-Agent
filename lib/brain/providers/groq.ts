@@ -21,7 +21,7 @@ import { getGroqApiKey } from "@/lib/brain/env";
 const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 /** Ceiling for the automatic retry after a reasoning-starved response. */
-const RETRY_TOKEN_FLOOR = 2048;
+const RETRY_TOKEN_FLOOR = 4096;
 
 export interface GroqMessage {
   role: "system" | "user" | "assistant";

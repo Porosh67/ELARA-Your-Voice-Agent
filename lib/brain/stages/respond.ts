@@ -1135,13 +1135,13 @@ export function containsCapabilityLeak(text: string): boolean {
 }
 
 /**
- * Live turns cap the SERP retry at TWO attempts inside the shared deadline.
+ * Live turns cap the SERP retry at THREE attempts inside the shared deadline.
  *
  * The provider's own default is three (reject → backoff → reject → backoff →
- * try); a deterministic LIVE turn knows its query is right, so a second reject
- * is the answer — burning a third attempt only delayed the honest line.
+ * try); a deterministic LIVE turn knows its query is right, so a third attempt
+ * gives a flaky gateway one more chance before the honest line.
  */
-const LIVE_MAX_SEARCH_ATTEMPTS = 2;
+const LIVE_MAX_SEARCH_ATTEMPTS = 3;
 
 /** What this live lookup was actually waiting on. */
 type LiveLookupKind = "time" | "weather" | "search";

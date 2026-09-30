@@ -45,3 +45,7 @@ lint.log
 *.tsbuildinfo
 next-env.d.ts
 .tsc-status.txt
+
+# scratch / verification artifacts
+VERIFY*.txt
+*.out
