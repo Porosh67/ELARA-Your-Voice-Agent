@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { useReducedMotion } from "@/hooks/useReducedMotion";
 import { cn } from "@/lib/utils";
@@ -14,6 +15,9 @@ import type { VoiceStatus } from "@/lib/voice/types";
  *
  * `role="status"` + `aria-live="polite"` keeps screen readers informed of every
  * transition, which matters because the state changes without any user action.
+ *
+ * Memoized: the console re-renders on every transcript turn, and this component
+ * only needs to move when `status` (or `className`) actually changes.
  */
 
 interface StatusVisual {
@@ -28,7 +32,7 @@ interface StatusVisual {
   animated: boolean;
 }
 
-/** One visual per state, so all six states are covered by construction. */
+/** One visual per state, so all eight states are covered by construction. */
 const STATUS_VISUALS: Record<VoiceStatus, StatusVisual> = {
   idle: {
     label: "Ready",
@@ -58,6 +62,20 @@ const STATUS_VISUALS: Record<VoiceStatus, StatusVisual> = {
     tone: "text-foreground/75",
     animated: true,
   },
+  searching: {
+    label: "Searching",
+    dot: "bg-amber-400",
+    halo: "shadow-[0_0_12px_2px_var(--glow)]",
+    tone: "text-foreground/75",
+    animated: true,
+  },
+  "search-found": {
+    label: "Live results",
+    dot: "bg-emerald-400",
+    halo: "shadow-[0_0_12px_2px_var(--glow)]",
+    tone: "text-foreground/75",
+    animated: true,
+  },
   speaking: {
     label: "Speaking",
     dot: "bg-emerald-400",
@@ -79,7 +97,7 @@ interface VoiceStatusPillProps {
   className?: string;
 }
 
-export function VoiceStatusPill({ status, className }: VoiceStatusPillProps) {
+function VoiceStatusPillComponent({ status, className }: VoiceStatusPillProps) {
   const prefersReducedMotion = useReducedMotion();
   const { label, dot, halo, tone, animated } = STATUS_VISUALS[status];
 
@@ -128,4 +146,7 @@ export function VoiceStatusPill({ status, className }: VoiceStatusPillProps) {
     </div>
   );
 }
+
+/** Skips re-renders that do not change the voice status itself. */
+export const VoiceStatusPill = memo(VoiceStatusPillComponent);
 

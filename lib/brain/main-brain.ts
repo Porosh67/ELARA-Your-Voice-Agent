@@ -11,6 +11,7 @@ import {
   isCannedReply,
 } from "@/lib/brain/types";
 import type {
+  BrainProgressCallback,
   BrainResult,
   BrainTurn,
   EmotionHint,
@@ -18,8 +19,8 @@ import type {
 } from "@/lib/brain/types";
 import { inputSafetyPasses, outputSafetyPasses } from "@/lib/brain/stages/safety";
 import { classifyRequest, containsCredentialLikeText, policyReplyFor } from "@/lib/brain/safety-policy";
-import { containsCapabilityLeak, stageRespond } from "@/lib/brain/stages/respond";
-import { polishForSpokenText, stageReorganize } from "@/lib/brain/stages/reorganize";
+import { containsCapabilityLeak, isSimpleChatTurn, stageRespond } from "@/lib/brain/stages/respond";
+import { needsReorganize, polishForSpokenText, stageReorganize } from "@/lib/brain/stages/reorganize";
 
 /**
  * Elara's last actually-spoken line in the history, or `null` when there is none.
@@ -62,14 +63,23 @@ function previousAssistantLine(turns: BrainTurn[]): string | null {
  * Every failure path ends in a SAFE message that still reaches TTS, so the
  * voice loop can never die inside the brain.
  */
-export async function runMainBrain(input: {
-  text: string;
-  turns: BrainTurn[];
-  /** Full-turn language lock, sent by the client — never re-guessed here. */
-  language?: ReplyLanguage;
-  /** Deterministic emotion hint from the transcript — colours the tone only. */
-  emotion?: EmotionHint | null;
-}): Promise<BrainResult> {
+export async function runMainBrain(
+  input: {
+    text: string;
+    turns: BrainTurn[];
+    /** Full-turn language lock, sent by the client — never re-guessed here. */
+    language?: ReplyLanguage;
+    /** Deterministic emotion hint from the transcript — colours the tone only. */
+    emotion?: EmotionHint | null;
+  },
+  /**
+   * Optional live-search progress sink (`searching` → `searched`). The route
+   * streams it to the client so the UI can show the search states while the
+   * reply is still being written; it carries no content and is never required
+   * — without it the pipeline behaves exactly as before.
+   */
+  onProgress?: BrainProgressCallback
+): Promise<BrainResult> {
   const language = input.language ?? "en";
 
   /*
@@ -114,7 +124,8 @@ export async function runMainBrain(input: {
       input.text,
       input.turns,
       language,
-      input.emotion ?? null
+      input.emotion ?? null,
+      onProgress
     );
 
     // Output-side policy hit (credential-shaped reply): the canned refusal is
@@ -136,12 +147,36 @@ export async function runMainBrain(input: {
      * inputs to the SAME single rewrite call — no extra model call, no extra
      * latency, no change to the output safety model.
      */
-    const reorganized = await stageReorganize(
-      responded.reply,
-      input.text,
-      input.emotion ?? null,
-      previousAssistantLine(input.turns)
-    );
+    const previousLine = previousAssistantLine(input.turns);
+
+    /*
+     * CONDITIONAL STEP 4 — the rewrite only runs when it has work to do.
+     *
+     * A canned line is final, a short warm reply is finished, and the same
+     * sentence cannot be "warmed up" twice; `needsReorganize` decides on those
+     * grounds (tone hint, opener collision, length) and returns false for
+     * everything else. The draft is spoken unchanged when it returns false —
+     * `reorganized` stays null, so the diagnostics report it honestly.
+     */
+    const rewrite = needsReorganize({
+      reply: responded.reply,
+      emotion: input.emotion ?? null,
+      previousAssistantLine: previousLine,
+      simpleChat: isSimpleChatTurn(input.text),
+      // A reply grounded in fresh search results: a short one is already the
+      // answer, and a tone rewrite could blur the fact it carries (a time, a
+      // temperature, a price) — so it skips Step 4 the way simple chat does.
+      groundedLive: responded.usedSearch,
+    });
+
+    const reorganized = rewrite
+      ? await stageReorganize(
+          responded.reply,
+          input.text,
+          input.emotion ?? null,
+          previousLine
+        )
+      : null;
     const draft = polishForSpokenText(reorganized ?? responded.reply);
 
     // ── Step 5: output safety ────────────────────────────────────────────────
@@ -179,19 +214,33 @@ export async function runMainBrain(input: {
       };
     }
 
-    const outputOk = await outputSafetyPasses(input.text, draft);
+    /*
+     * STEP 5 — skipped for CANNED lines only.
+     *
+     * INVARIANT (this is what makes the skip safe):
+     *   canned ⇒ a constant in this repository ⇒ already safe.
+     *   `needsReorganize` also returns false for a canned draft, so no
+     *   model-written rewrite can ever produce a canned-normalized string.
+     * Therefore a draft that reaches this point is either a literal
+     * repository constant (skippable) or genuine model output (checked).
+     *
+     * Every model-written draft is still screened, exactly as before.
+     */
+    if (!isCannedReply(draft)) {
+      const outputOk = await outputSafetyPasses(input.text, draft);
 
-    if (outputOk === false) {
-      return {
-        reply: OUTPUT_BLOCKED_REPLY,
-        meta: {
-          usedSearch: responded.usedSearch,
-          fastAssist: responded.fastAssist,
-          reorganized: reorganized !== null,
-          guardBlocked: true,
-          fellBack: false,
-        },
-      };
+      if (outputOk === false) {
+        return {
+          reply: OUTPUT_BLOCKED_REPLY,
+          meta: {
+            usedSearch: responded.usedSearch,
+            fastAssist: responded.fastAssist,
+            reorganized: reorganized !== null,
+            guardBlocked: true,
+            fellBack: false,
+          },
+        };
+      }
     }
 
     return {

@@ -8,7 +8,7 @@ import {
 } from "@/lib/brain/models";
 import { groqChat } from "@/lib/brain/providers/groq";
 import { ollamaChat } from "@/lib/brain/providers/ollama";
-import { looksLikeRefusal } from "@/lib/brain/stages/respond";
+import { looksLikeRefusal, echoesLastReply } from "@/lib/brain/stages/respond";
 import { isCannedReply } from "@/lib/brain/types";
 import type { EmotionHint } from "@/lib/brain/types";
 
@@ -149,12 +149,113 @@ function rewriteMessages(
   ];
 }
 
+/**
+ * SHOULD THIS REPLY BE REWRITTEN AT ALL?
+ *
+ * OBSERVED PROBLEM THIS CLOSES.
+ *
+ * `stageReorganize` ran on EVERY turn: a Qwen round trip (with a nemotron
+ * fallback behind it) to "warm up" replies the responder had already written in
+ * Elara's own voice — and, worst of all, on canned lines. A clarification, an
+ * honest "I can't check that right now", or a safety refusal is a FINAL
+ * sentence; sending it through a rewrite cost two more upstream calls on the
+ * slowest paths in the loop, and `polishForSpokenText` then returned it
+ * untouched anyway.
+ *
+ * THE RULE.
+ *
+ * A rewrite is worth its latency only when there is something for it to fix:
+ *
+ *   - a reply long enough that rhythm and brevity can genuinely improve,
+ *   - a turn carrying an emotion hint, where the tone has to survive the reply,
+ *   - or a short reply whose opening repeats the previous one, which the ear
+ *     notices as "she said that again".
+ *
+ * Everything else — the short, already-warm replies that make up most of a
+ * conversation — is spoken as the responder wrote it. Canned and empty replies
+ * are never rewritten. Nothing here changes WHICH reply is chosen, only whether
+ * a polish pass runs on it, and `stageReorganize` still refuses any rewrite
+ * that does not preserve the draft's meaning.
+ */
+const SHORT_REPLY_MAX_CHARS = 160;
+const SHORT_REPLY_MAX_SENTENCES = 2;
+
+export interface ReorganizeDecisionInput {
+  reply: string;
+  /** Tone hint for the turn; a hint means the rewrite has tone work to do. */
+  emotion: EmotionHint | null;
+  /** Elara's previous spoken line, for the opener-collision check. */
+  previousAssistantLine: string | null;
+  /** True when the turn was small talk — see `isSimpleChatTurn`. */
+  simpleChat: boolean;
+  /**
+   * True when the reply is grounded in fresh search results (a LIVE turn).
+   * A SHORT grounded reply is already the answer — facts included — so the
+   * tone rewrite is skipped for it exactly as for simple chat: a rewrite
+   * costs a model call to say the same thing with different words, and the
+   * wording it changes may be the very number or temperature the person asked
+   * for. Long grounded drafts still get the brevity pass they need.
+   */
+  groundedLive?: boolean;
+}
+
+export function needsReorganize(input: ReorganizeDecisionInput): boolean {
+  const reply = input.reply.trim();
+
+  // Nothing to polish, and canned lines are already final: refusals, the
+  // clarify line and the honest lookup lines are constants, not drafts.
+  if (reply.length === 0 || isCannedReply(reply)) {
+    return false;
+  }
+
+  const sentences = reply
+    .split(/[.!?…]+/)
+    .filter((sentence) => sentence.trim().length > 0).length;
+
+  const alreadyGood =
+    reply.length <= SHORT_REPLY_MAX_CHARS && sentences <= SHORT_REPLY_MAX_SENTENCES;
+
+  // Search-grounded live reply: short and already carrying the fresh fact, so
+  // neither a tone hint nor an opener collision may spend a rewrite on it.
+  if (input.groundedLive === true && alreadyGood) {
+    return false;
+  }
+
+  // Simple chat: the responder's short, warm reply is the finished article, and
+  // a rewrite would only cost a call to say the same thing differently.
+  if (input.simpleChat && alreadyGood) {
+    return false;
+  }
+
+  // A tone hint is the one thing the responder cannot check on its own, so a
+  // hint keeps the polish pass even on a short reply.
+  if (input.emotion !== null) {
+    return true;
+  }
+
+  if (
+    input.previousAssistantLine !== null &&
+    echoesLastReply(reply, input.previousAssistantLine)
+  ) {
+    return true;
+  }
+
+  // Long or multi-sentence replies are the case the rewrite exists for.
+  return !alreadyGood;
+}
+
 export async function stageReorganize(
   draft: string,
   userText: string,
   emotion: EmotionHint | null = null,
   previousAssistantLine: string | null = null
 ): Promise<string | null> {
+  // Defence in depth: even if a caller bypass check is ever missed, a canned
+  // line is never handed to a model.
+  if (isCannedReply(draft)) {
+    return null;
+  }
+
   const qwen = await groqChat({
     model: GROQ_MODELS.reorganize,
     messages: rewriteMessages(draft, userText, emotion, previousAssistantLine),

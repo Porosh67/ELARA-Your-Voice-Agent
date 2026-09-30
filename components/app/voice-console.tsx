@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { AlertCircle } from "lucide-react";
 import { VoiceOrb } from "@/components/app/voice-orb";
@@ -8,7 +8,11 @@ import { VoiceStatusPill } from "@/components/app/voice-status-pill";
 import { EASE_OUT } from "@/components/ui/reveal";
 import { useReducedMotion } from "@/hooks/useReducedMotion";
 import { useVoiceSession } from "@/hooks/useVoiceSession";
-import { hasVoiceForLanguage, isSpeechSynthesisSupported } from "@/lib/voice/speech";
+import {
+  hasVoiceForLanguage,
+  isSpeechSynthesisSupported,
+  warmupVoices,
+} from "@/lib/voice/speech";
 import { getVoiceLanguage } from "@/lib/voice/languages";
 import type { TranscriptTurn, VoiceStatus } from "@/lib/voice/types";
 import { cn } from "@/lib/utils";
@@ -33,6 +37,8 @@ const STATUS_CAPTIONS: Record<VoiceStatus, string> = {
   connecting: "Opening the microphone…",
   listening: "Listening — tap the orb to stop.",
   thinking: "Thinking…",
+  searching: "Searching live…",
+  "search-found": "Found live results",
   speaking: "Speaking — tap the orb to stop.",
   error: "Tap the orb to try again.",
 };
@@ -41,7 +47,7 @@ const STATUS_CAPTIONS: Record<VoiceStatus, string> = {
    Transcript
    ────────────────────────────────────────────────────────────────────────── */
 
-function TurnBubble({ turn }: { turn: TranscriptTurn }) {
+function TurnBubbleComponent({ turn }: { turn: TranscriptTurn }) {
   const isUser = turn.speaker === "you";
 
   return (
@@ -78,6 +84,65 @@ function TurnBubble({ turn }: { turn: TranscriptTurn }) {
   );
 }
 
+/**
+ * A finalized turn, memoized: a new turn only re-renders ITS own bubble.
+ *
+ * The console re-renders on every status flip and (coalesced) partial revision;
+ * without this, each of those renders would re-run every bubble's spring
+ * animation setup in the list above it.
+ */
+const TurnBubble = memo(TurnBubbleComponent);
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Live (still-revising) utterance
+   ────────────────────────────────────────────────────────────────────────── */
+
+function LivePartialBubbleComponent({
+  text,
+  prefersReducedMotion,
+}: {
+  text: string;
+  prefersReducedMotion: boolean;
+}) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ type: "spring", stiffness: 380, damping: 32 }}
+      className="flex flex-col items-end gap-2"
+    >
+      <span className="flex items-center gap-2 text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground/60">
+        <span
+          aria-hidden="true"
+          className={cn(
+            "h-1 w-1 rounded-full bg-primary/50",
+            !prefersReducedMotion && "animate-breathe",
+          )}
+        />
+        You · live
+      </span>
+      <p className="max-w-[85%] rounded-2xl rounded-br-md border border-dashed border-border/70 bg-surface-muted/30 px-4 py-3 text-sm italic leading-[1.7] text-muted-foreground">
+        {text}
+        <span
+          aria-hidden="true"
+          className={cn(
+            "ml-1 inline-block h-3.5 w-[2px] translate-y-[2px] rounded-full bg-primary/60",
+            !prefersReducedMotion && "animate-breathe",
+          )}
+        />
+      </p>
+    </motion.div>
+  );
+}
+
+/**
+ * The live utterance is its own memoized component so a partial revision only
+ * re-renders THIS bubble (the text prop moving is the one legitimate reason to
+ * do work) instead of the whole console subtree — the bubbles, the pill and the
+ * orb all stay put while someone is still talking.
+ */
+const LivePartialBubble = memo(LivePartialBubbleComponent);
+
 /* ──────────────────────────────────────────────────────────────────────────
    The console
    ────────────────────────────────────────────────────────────────────────── */
@@ -100,6 +165,7 @@ export function VoiceConsole() {
     language,
     languageNotice,
     isActive,
+    prefetch,
     start,
     stop,
     clearTranscript,
@@ -142,6 +208,25 @@ export function VoiceConsole() {
       cancelled = true;
     };
   }, [mounted, language]);
+
+  /*
+   * TTS WARMUP — as soon as the console is on screen.
+   *
+   * Reading the platform's voice list (and letting the synthesiser load it) is
+   * work that would otherwise land on the FIRST reply's critical path, where it
+   * reads as Elara "thinking" for an extra beat before she speaks. Warming it
+   * here — and again at session start inside the hook — means the first syllable
+   * is never waiting on an asynchronous platform call. The hook's own session
+   * start warms it again in case this mount ran before speech synthesis was
+   * ready.
+   */
+  useEffect(() => {
+    if (!mounted || !isSpeechSynthesisSupported()) {
+      return;
+    }
+
+    warmupVoices();
+  }, [mounted]);
 
   /*
    * AUTO-SCROLL — and only the transcript moves.
@@ -226,14 +311,15 @@ export function VoiceConsole() {
   const hasTranscript = turns.length > 0 || partialTranscript.length > 0;
 
   // The orb is the only control: tap to start, tap again to stop.
-  const handleToggle = () => {
+  // Stable identity, so the memoized orb does not re-render with the console.
+  const handleToggle = useCallback(() => {
     if (isActive) {
       stop();
       return;
     }
 
     void start();
-  };
+  }, [isActive, start, stop]);
 
   return (
     <div className="w-full max-w-xl">
@@ -325,7 +411,13 @@ export function VoiceConsole() {
 
             <VoiceStatusPill status={status} />
 
-            <div className="mt-7">
+            {/*
+              Approaching the orb (hover, or keyboard focus reaching it) mints
+              the next session's streaming token, so the tap that follows has
+              one less round trip on the critical path. `prefetch` is a no-op
+              while a session is live or while a token is already held.
+            */}
+            <div className="mt-7" onPointerEnter={prefetch} onFocus={prefetch}>
               <VoiceOrb
                 status={status}
                 isActive={isActive}
@@ -383,33 +475,10 @@ export function VoiceConsole() {
 
                   {/* Live, still-revising utterance from the STT stream. */}
                   {partialTranscript ? (
-                    <motion.div
-                      initial={{ opacity: 0, y: 8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ type: "spring", stiffness: 380, damping: 32 }}
-                      className="flex flex-col items-end gap-2"
-                    >
-                      <span className="flex items-center gap-2 text-[10px] font-medium uppercase tracking-[0.2em] text-muted-foreground/60">
-                        <span
-                          aria-hidden="true"
-                          className={cn(
-                            "h-1 w-1 rounded-full bg-primary/50",
-                            !prefersReducedMotion && "animate-breathe",
-                          )}
-                        />
-                        You · live
-                      </span>
-                      <p className="max-w-[85%] rounded-2xl rounded-br-md border border-dashed border-border/70 bg-surface-muted/30 px-4 py-3 text-sm italic leading-[1.7] text-muted-foreground">
-                        {partialTranscript}
-                        <span
-                          aria-hidden="true"
-                          className={cn(
-                            "ml-1 inline-block h-3.5 w-[2px] translate-y-[2px] rounded-full bg-primary/60",
-                            !prefersReducedMotion && "animate-breathe",
-                          )}
-                        />
-                      </p>
-                    </motion.div>
+                    <LivePartialBubble
+                      text={partialTranscript}
+                      prefersReducedMotion={prefersReducedMotion}
+                    />
                   ) : null}
 
                 </div>
@@ -442,9 +511,21 @@ export function VoiceConsole() {
             ) : null}
           </AnimatePresence>
 
-          {/* Footnote — one short line, kept quiet. */}
+          {/*
+            Footnote — kept quiet, but now complete.
+
+            "Audio is never stored" is true and is the promise that matters, so
+            it stays first. What was missing is *who processes it*: speech-to-text
+            runs through a streaming provider, the reply is generated by hosted
+            models, and some languages fall back to the browser's own speech
+            recognition. None of it is recorded to disk or to our database, but
+            the data does leave the device, and the UI should say so plainly.
+          */}
           <p className="mt-7 text-center text-[11px] leading-relaxed text-muted-foreground/55">
-            Audio is never stored.
+            Audio is never stored. Live speech is processed by a streaming
+            speech-to-text service, and replies are generated by hosted AI
+            models; some languages use your browser&apos;s built-in recognition
+            instead. Nothing is saved to your account.
           </p>
 
           {languageNotice ? (

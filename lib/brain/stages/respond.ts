@@ -13,10 +13,16 @@ import type { GroqMessage } from "@/lib/brain/providers/groq";
 import { serpSearchDetailed } from "@/lib/brain/providers/brightdata";
 import type { SerpResult } from "@/lib/brain/providers/brightdata";
 import { isBrightDataConfigured } from "@/lib/brain/env";
-import { containsCredentialLikeText, policyReplyFor } from "@/lib/brain/safety-policy";
+import {
+  classifyRequest,
+  containsCredentialLikeText,
+  policyReplyFor,
+} from "@/lib/brain/safety-policy";
+import type { PolicyVerdict } from "@/lib/brain/safety-policy";
 import { isLowConfidenceTranscript, replyLanguageMatches } from "@/lib/voice/language-lock";
 import {
   BRAIN_UNAVAILABLE_BN,
+  INPUT_BLOCKED_REPLY,
   SAFE_FALLBACK_REPLY,
   SEARCH_SYNTHESIS_FAILED_REPLY,
   SEARCH_SYNTHESIS_FAILED_REPLY_BN,
@@ -29,7 +35,12 @@ import {
   clarifyLine,
   isCannedReply,
 } from "@/lib/brain/types";
-import type { BrainTurn, EmotionHint, ReplyLanguage } from "@/lib/brain/types";
+import type {
+  BrainProgressCallback,
+  BrainTurn,
+  EmotionHint,
+  ReplyLanguage,
+} from "@/lib/brain/types";
 
 /**
  * Step 2 (fast assist) + Step 3 (main reasoning and response).
@@ -50,11 +61,12 @@ import type { BrainTurn, EmotionHint, ReplyLanguage } from "@/lib/brain/types";
  *  - Step 3 (gpt-oss-120b) carries the personality contract and produces the
  *    spoken reply. If it fails, or if it refuses a message the input guard
  *    already cleared, the assist draft is spoken instead of the refusal.
- *  - Bright Data SERP stays optional, but a turn that needed live facts and got
- *    no usable results speaks ONE honest canned line — never an invented time,
- *    temperature, score, price or headline. With no token the same canned line
- *    is chosen before any model is asked, so the `[SEARCH: …]` marker — a
- *    pipeline instruction, never speech — can never reach the speaker.
+ *  - Bright Data SERP runs BEFORE the responder on turns the router decided
+ *    are LIVE — intent first, then one grounded synthesis — so a turn that
+ *    needs live facts never pays for a from-memory draft. With no usable
+ *    results the same ONE honest canned line is chosen before any model is
+ *    asked, so the `[SEARCH: …]` marker — a pipeline instruction, never
+ *    speech — can never reach the speaker.
  */
 
 /**
@@ -537,17 +549,122 @@ function shapedTimeQuery(text: string): string | null {
   return `${head} ${match[2]} ${place}`;
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   BANGLA / BANGLISH LIVE INTENT — the same contract as the English classes.
+   ──────────────────────────────────────────────────────────────────────────
+   The English classes above cannot read a Bangla turn, so a Bangla or
+   romanised-Bangla ask used to arm NOTHING server-side and lived or died on
+   the model's own `[SEARCH: …]`. These classes keep the exact same contract —
+   DOMAIN (freshness subject) + ASK (a question shape) behind the chat guards —
+   in both scripts, and are deliberately NOT a fixed city list or a demo phrase
+   script: any place, price, score or headline wording in either script arms
+   the same lookup. The romanised (Banglish) half covers the way these demos
+   are actually typed: "Dhakay ajker weather kemon?", "Ekhon Tokyo te koyta
+   bajey?", "ki khobor ajker?", "koto dam?".
+   */
+
+/** Bangla greeting guards. "ki khobor?" / "কি খবর?" is HELLO — not news. */
+const BANGLA_GREETING_GUARD = /^(?:(?:কি|কী)\s*খবর|ki\s+khobor)\b/i;
+
+/**
+ * Freshness qualifiers that flip the "ki khobor?" GREETING into a NEWS ask:
+ * "ki khobor ajker?" ("what's today's news?") must search, bare "ki khobor?"
+ * must not.
+ */
+const NEWS_QUALIFIER =
+  /\b(?:ajker|ajke|ajer|today|tonight|latest|breaking|headline|current|right\s+now|now)\b|আজকের|আজকে|সর্বশেষ|হেডলাইন|এখন/i;
+
+/** Freshness domains in Bangla script. Broad on purpose — any place, any market. */
+const BANGLA_LIVE_DOMAINS =
+  /আবহাওয়া|আবহাওয়ার|তাপমাত্রা|তাপক্রাপ|খবর|সংবাদ|সর্বশেষ|হেডলাইন|দাম|মূল্য|রেট|ফলাফল|স্কোর|নিউজ|বাজার|সময়সূচি|তারিখ|ট্রাফিক/u;
+
+/**
+ * Freshness domains in ROMANISED Bangla (Banglish), merged with the English
+ * twins a mixed sentence usually carries. "khobor" (news), "dam" (price) and
+ * "bajar" (market) are the demo staples; everything else is the same English
+ * vocabulary people naturally mix into Banglish typing.
+ */
+const BANGLISH_LIVE_DOMAINS =
+  /\b(?:khobor|khabor|khabar|dam|daam|dame|bajar|weather|forecast|temperature|news|headlines?|prices?|exchange|rate|rates|scores?|results?|schedule|timetable|traffic|latest|breaking|current)\b/i;
+
+/**
+ * A question shape in either script. A `?` (or danda) counts — transcripts
+ * often carry one — and so does an interrogative in Bangla or Banglish
+ * ("kemon", "koto", "koyta", "ki", "কেমন", "কত", "কয়টা", …).
+ */
+const BANGLA_ASK_SHAPE =
+  /[?।\u0964]|\b(?:kemon|kemo|koto|koyta|koida|kothay|ken|kibhabe|korcho|korbe|hobe|hol|laglo|ki)\b|^(?:কি|কী|কেমন|কোন|কত|কয়|কখন|কোথা|কেন|কিভাবে)\b|(?:কেমন|কতটা|কয়টা|কি\s*খবর|কী\s*খবর)/iu;
+
+/** Clock asks in Bangla script — "কয়টা বাজে", "কি সময়", "সময় কত". */
+const BANGLA_TIME_INTENT =
+  /(?:কয়টা|কতটা|কটা)\s*বাজ|(?:কত|কয়)\s*বাজে|(?:কয়টা|কতটা)\s*সময়|সময়\s*(?:কত|কয়)|এখন\s*কয়|কি\s*সময়/u;
+
+/**
+ * Clock asks in Banglish — "Ekhon Tokyo te koyta bajey?", "koto shomoy?",
+ * "ki baje?". Paired forms only: a bare "baje" (sounds/rings) with no
+ * quantity word is a remark, not a clock request.
+ */
+const BANGLISH_TIME_INTENT =
+  /\b(?:koyta|koto|kemne|ki)\s+baj(?:ey|e|che)\b|\bbaj(?:ey|e)\s+(?:koyta|koto)\b|\b(?:koyta|koto)\s+(?:shomoy|somoy|ghonta)\b|\b(?:shomoy|somoy)\s+(?:koyta|koto)\b|\b(?:ki|koyta|koto)\s+time\b/i;
+
+/**
+ * Words that mark a turn as romanised Bangla, so the Banglish classes can
+ * recognise a mixed script without ever needing a fixed sentence list.
+ */
+const BANGLISH_TURN_MARKER =
+  /\b(?:ajker|ajke|ajer|ekhon|ekhoni|akhon|kemon|kemo|koto|koyta|koida|bajey|bajche|khobor|khabor|khabar|porer|porberto|agami|tokhon|hobe|laglo|kaisa|acho|achha|bhalo|valo)\b/i;
+
+/** Explicit search requests in either script: "search kore bolo", "খুঁজে বল". */
+const BANGLA_EXPLICIT_SEARCH =
+  /খুঁজে\s*(?:বল|দেখ|তুলি|নাও)|সার্চ\s*কর|গুগল\s*কর|search\s+kore|google\s+kore/iu;
+
+/**
+ * Banglish clock ask → the same shaped query the English shaper produces.
+ *
+ * "Ekhon Tokyo te koyta bajey?" becomes "current time in Tokyo" — the place is
+ * read from the SHAPE of the sentence (a place before "te", or after
+ * "in/at"), never from a city list. Both shapes miss → `null` and the person's
+ * own words are used verbatim, so shaping can only sharpen a lookup.
+ */
+function shapedBanglaTimeQuery(text: string): string | null {
+  const trimmed = text.trim().replace(/[?]+\s*$/, "");
+
+  const before = trimmed.match(
+    /\b([A-Za-z][\w-]{0,30})\s+te(?:y)?\s+(?:ekhon\s+)?(?:ki|koyta|koto)\s+baj(?:ey|e|che)\b/i
+  );
+  const after = trimmed.match(
+    /\b(?:ki|koyta|koto)\s+baj(?:ey|e|che)\s+(?:in|at)\s+([A-Za-z][\w-]{0,30})\b/i
+  );
+  const place = (before?.[1] ?? after?.[1] ?? "")
+    .trim()
+    .replace(/[.,!?]+$/, "");
+
+  if (place.length === 0 || place.length > 40) {
+    return null;
+  }
+
+  return `current time in ${place}`;
+}
+
 /** Exported so the detection battery can verify intent classes directly. */
 export function detectLiveIntent(userText: string): string | null {
   if (CHAT_GUARD.test(userText)) {
     return null;
   }
 
+  // "ki khobor?" / "কি খবর?" is a greeting — unless a freshness qualifier
+  // follows, which makes the very same words a news request.
+  if (BANGLA_GREETING_GUARD.test(userText) && !NEWS_QUALIFIER.test(userText)) {
+    return null;
+  }
+
   /*
-   * An EXPLICIT lookup verb ("look up", "google it") is a request on its own and
-   * outranks every guard below: the person said what they want.
+   * An EXPLICIT lookup verb ("look up", "google it", "search kore bolo") is a
+   * request on its own and outranks every guard below: the person said what
+   * they want.
    */
-  const explicitAsk = EXPLICIT_SEARCH_INTENT.test(userText);
+  const explicitAsk =
+    EXPLICIT_SEARCH_INTENT.test(userText) || BANGLA_EXPLICIT_SEARCH.test(userText);
 
   /*
    * A volatile subject only counts when the turn ASKS about it. A remark
@@ -565,16 +682,436 @@ export function detectLiveIntent(userText: string): string | null {
   const eventQuestion = !remark && CURRENT_EVENTS_INTENT.test(userText);
   const timeQuestion = isClockQuestion(userText);
 
-  if (!explicitAsk && !factQuestion && !eventQuestion && !timeQuestion) {
+  /*
+   * The Bangla / Banglish half — DOMAIN + ASK, the same contract as the
+   * English classes above, gated by the same remark guard and by the greeting
+   * guard at the top of this function.
+   */
+  const banglaTurn =
+    /[\u0980-\u09FF]/.test(userText) || BANGLISH_TURN_MARKER.test(userText);
+  const banglaAsk = BANGLA_ASK_SHAPE.test(userText);
+  const banglaFact =
+    banglaTurn &&
+    banglaAsk &&
+    !remark &&
+    (BANGLA_LIVE_DOMAINS.test(userText) || BANGLISH_LIVE_DOMAINS.test(userText));
+  const banglaTime =
+    banglaTurn &&
+    banglaAsk &&
+    !remark &&
+    (BANGLA_TIME_INTENT.test(userText) || BANGLISH_TIME_INTENT.test(userText));
+
+  if (
+    !explicitAsk &&
+    !factQuestion &&
+    !eventQuestion &&
+    !timeQuestion &&
+    !banglaFact &&
+    !banglaTime
+  ) {
     return null;
   }
 
   // A clock question is shaped to the exact lookup that answers with the time
-  // ("What time is it in Tokyo?" → "current time in Tokyo"); every other
-  // intent keeps the person's own words verbatim.
-  const shaped = timeQuestion ? shapedTimeQuery(userText) : null;
+  // ("What time is it in Tokyo?" → "current time in Tokyo"; "Ekhon Tokyo te
+  // koyta bajey?" → the same shaped query); every other intent keeps the
+  // person's own words verbatim.
+  const shaped = timeQuestion
+    ? shapedTimeQuery(userText)
+    : banglaTime
+      ? shapedBanglaTimeQuery(userText)
+      : null;
   const query = (shaped ?? userText.trim()).slice(0, 140);
   return query.length >= 6 ? query : null;
+}
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+   FOLLOW-UP LIVE REQUESTS — "What about tomorrow?"
+   ──────────────────────────────────────────────────────────────────────────
+   A follow-up narrows or extends the person's OWN last live ask in time
+   ("What's the weather in Dhaka?" → "What about tomorrow?"). It qualifies
+   only when ALL of these hold:
+
+     - the turn is SHORT and carries a TIME HORIZON (tomorrow, tonight,
+       "ekhon", "porer", a weekday, …),
+     - it is asked as a question or hangs off an anaphora ("what about", "eta"),
+     - it is not chat/remark/greeting shaped,
+     - and the person's OWN most recent turn was itself a LIVE ask
+       (`detectLiveIntent` armed it).
+
+   Anything else stays conversation — "tell me a joke", "how about lunch?"
+   after a weather turn, or a horizon word with no prior live ask never
+   search. The composed query grafts the horizon onto the prior query's own
+   words: "weather in Dhaka" + "tomorrow" → "… Dhaka tomorrow".
+   */
+
+/** Time-horizon words a follow-up can graft onto the previous live query. */
+const FOLLOWUP_HORIZON =
+  /\b(?:tomorrow|today|tonight|later|again|right\s+now|now|this\s+(?:morning|afternoon|evening|week)|next\s+(?:week|month|day|morning|evening)|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b(?:kal|porshu|parshu|agami|porer|porberto|aj|ajke|ekhon|ekhoni)\b/i;
+
+/** Anaphora that opens a follow-up: "what about …", "eta …". */
+const FOLLOWUP_ANAPHORA =
+  /^(?:what\s+about|how\s+about|what'?s\s+about|and\s+about|eta|oita|oi\s*ta|tarpor|er\s+por)\b/i;
+
+/** Leading anaphora stripped before the modifier joins the prior query. */
+const FOLLOWUP_LEAD =
+  /^(?:what\s+about|how\s+about|what'?s\s+about|and\s+about|eta|oita|oi\s*ta|tarpor|er\s+por)\s*/i;
+
+/**
+ * Resolve a SHORT time-shaped follow-up against the recent window only.
+ *
+ * Returns the composed search query, or `null` when the turn is ordinary
+ * conversation. Pure and deterministic — no network, no model — so the routing
+ * decision stays testable end to end.
+ */
+function resolveFollowupIntent(
+  userText: string,
+  history: BrainTurn[]
+): string | null {
+  const text = userText.trim();
+
+  if (text.length < 3 || text.length > 60) {
+    return null;
+  }
+
+  if (!FOLLOWUP_HORIZON.test(text)) {
+    return null;
+  }
+
+  // A question mark, an anaphora lead, or an interrogative — a bare statement
+  // carrying a horizon word ("I love Fridays") is a remark, not a request.
+  const asked =
+    text.includes("?") ||
+    FOLLOWUP_ANAPHORA.test(text) ||
+    /^(?:is|will|does|do|when|what|how|eta|oita|কেমন|কত|কখন)\b/i.test(text);
+
+  if (!asked) {
+    return null;
+  }
+
+  if (
+    CHAT_GUARD.test(text) ||
+    COMMENTARY_GUARD.test(text) ||
+    BANGLA_GREETING_GUARD.test(text)
+  ) {
+    return null;
+  }
+
+  // The person's OWN most recent turn must have been a live ask — the canned
+  // replies are already stripped from `conversationHistory`, and no assistant
+  // turn can ever anchor a follow-up.
+  const recent = conversationHistory(history);
+  let lastUserText: string | null = null;
+
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    if (recent[index].speaker === "you") {
+      lastUserText = recent[index].text;
+      break;
+    }
+  }
+
+  if (lastUserText === null) {
+    return null;
+  }
+
+  const priorQuery = detectLiveIntent(lastUserText);
+
+  if (priorQuery === null) {
+    return null;
+  }
+
+  const modifier = text.replace(FOLLOWUP_LEAD, "").replace(/[?]+\s*$/, "").trim();
+  const base = priorQuery.replace(/[?]+\s*$/, "").trim();
+  const query = `${base} ${modifier}`.slice(0, 140);
+  return query.length >= 6 ? query : null;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   THE ROUTER — one authoritative decision per turn: CHAT | LIVE | BLOCK.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * `block` — the deterministic policy gate (`classifyRequest`), the same
+ *   verdict `main-brain.ts` fast-fails on before any stage runs.
+ * `live`  — `query` is what Bright Data is asked, `lookupKind` picks which
+ *   honest fallback line a failure earns (time / weather / search).
+ * `ambiguous` — a freshness/time signal that a chat guard or missing ask
+ *   shape suppressed: ordinary conversation, but the class where the model's
+ *   own `[SEARCH: …]` marker is EXPECTED to arm a lookup.
+ * `chat` — nothing live about it; answered from the responder alone (the
+ *   marker still works here as a safety net for wording no class covers).
+ */
+export type TurnRouteKind = "block" | "live" | "ambiguous" | "chat";
+
+export interface TurnRoute {
+  kind: TurnRouteKind;
+  /** The policy verdict — only non-"allow" when `kind === "block"`. */
+  verdict: PolicyVerdict;
+  /** LIVE only: the search query, derived from the person's own words. */
+  query: string | null;
+  /** LIVE only: which honest fallback line a failed lookup earns. */
+  lookupKind: LiveLookupKind | null;
+  /** Why the decision was made — diagnostics and tests, never spoken. */
+  reason: "policy" | "intent" | "followup" | "guarded-live" | "default";
+}
+
+/**
+ * Does this turn carry a freshness/time signal at all — i.e. did something
+ * GUARD it away from `live`? Used only to label the `ambiguous` class; it
+ * changes no behaviour by itself.
+ */
+function hasGuardedLiveSignal(text: string): boolean {
+  return (
+    LIVE_FACT_DOMAINS.test(text) ||
+    CURRENT_EVENTS_INTENT.test(text) ||
+    LIVE_TIME_INTENT.test(text) ||
+    BANGLA_LIVE_DOMAINS.test(text) ||
+    BANGLISH_LIVE_DOMAINS.test(text) ||
+    BANGLA_TIME_INTENT.test(text) ||
+    BANGLISH_TIME_INTENT.test(text)
+  );
+}
+
+/**
+ * THE one place a turn is decided. Deterministic and side-effect free: no
+ * network, no model — the same input always produces the same decision, so
+ * the regression battery can verify every class directly.
+ */
+export function routeTurn(userText: string, history: BrainTurn[]): TurnRoute {
+  const verdict = classifyRequest(userText);
+
+  if (verdict !== "allow") {
+    return { kind: "block", verdict, query: null, lookupKind: null, reason: "policy" };
+  }
+
+  const direct = detectLiveIntent(userText);
+
+  if (direct !== null) {
+    return {
+      kind: "live",
+      verdict: "allow",
+      query: direct,
+      lookupKind: lookupKindFor(userText, direct),
+      reason: "intent",
+    };
+  }
+
+  const followup = resolveFollowupIntent(userText, history);
+
+  if (followup !== null) {
+    return {
+      kind: "live",
+      verdict: "allow",
+      query: followup,
+      lookupKind: lookupKindFor(userText, followup),
+      reason: "followup",
+    };
+  }
+
+  if (hasGuardedLiveSignal(userText)) {
+    return {
+      kind: "ambiguous",
+      verdict: "allow",
+      query: null,
+      lookupKind: null,
+      reason: "guarded-live",
+    };
+  }
+
+  return { kind: "chat", verdict: "allow", query: null, lookupKind: null, reason: "default" };
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   THE SIMPLE-CHAT FAST LANE — when a turn needs no more than the responder.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * OBSERVED PROBLEM THIS CLOSES.
+ *
+ * "Hi", "how are you?", "tell me a joke", "I'm exhausted" were paying for the
+ * whole critical path: a Google assist round trip that answers `SKIP` anyway, a
+ * Qwen rewrite of a reply the responder had already written in Elara's own
+ * voice, and — on an echo collision — one more responder call to reword it.
+ * Four upstream calls to say "hey, how's it going?".
+ *
+ * WHAT THIS IS NOT.
+ *
+ * It is not a shortcut around safety, and it is not a second responder. The
+ * deterministic policy gate still runs FIRST and unchanged on every turn
+ * (`main-brain.ts`), the input guard still runs, the Elara responder still
+ * writes the reply, and the output guard still checks it. All this decides is
+ * which OPTIONAL quality stages are worth their latency.
+ *
+ * WHY AN ALLOWLIST.
+ *
+ * A turn is only ever fast-laned on POSITIVE evidence that it is small talk —
+ * an opener from a short closed set — and only when no live-lookup intent was
+ * found, the text is short, and no sensitive word appears at all. Every other
+ * turn, including everything in a script this list does not cover, takes the
+ * fully guarded path. Uncertainty always resolves to `false`.
+ */
+
+/** Above this many characters a turn is no longer "simple" by definition. */
+const SIMPLE_CHAT_MAX_CHARS = 80;
+/** Above this many words the same applies — a long sentence is not a greeting. */
+const SIMPLE_CHAT_MAX_WORDS = 14;
+
+/**
+ * Openers that can only be small talk.
+ *
+ * Matched on the FOLDED form (lowercase, punctuation stripped, whitespace
+ * collapsed) as either the whole turn or its prefix, so "hi!" and
+ * "hey, how's your day going" both qualify while "hi, what's the weather in
+ * Kyoto" does not — the live-intent check below rejects it first.
+ */
+const SIMPLE_CHAT_OPENERS: readonly string[] = [
+  "hi",
+  "hey",
+  "heya",
+  "hello",
+  "yo",
+  "hiya",
+  "good morning",
+  "good afternoon",
+  "good evening",
+  "good night",
+  "how are you",
+  "how're you",
+  "how are things",
+  "how's it going",
+  "hows it going",
+  "how is it going",
+  "how have you been",
+  "what's up",
+  "whats up",
+  "what's new",
+  "whats new",
+  "are you there",
+  "you there",
+  "good to see you",
+  "long time no see",
+  "tell me a joke",
+  "tell me something funny",
+  "say something funny",
+  "got any jokes",
+  "any jokes",
+  "thanks",
+  "thank you",
+  "good job",
+  "well done",
+  "nice",
+  "cool",
+  "ok",
+  "okay",
+  "sure",
+  "yes",
+  "no",
+  "maybe",
+  "lol",
+  "haha",
+  "hehe",
+  "wow",
+  "whoa",
+  "oops",
+  "sorry",
+  "congratulations",
+  "congrats",
+  "good luck",
+  "i feel",
+  "i'm",
+  "i am",
+  "i've been",
+  "that's funny",
+  "thats funny",
+  "that's great",
+  "thats great",
+];
+
+/**
+ * Bangla openers, deliberately tiny.
+ *
+ * Bangla live-intent detection on the server side is English-shaped (see
+ * `FACT_REQUEST_SHAPE`), so a Bangla turn is only fast-laned when it OPENS with
+ * one of these and stays very short. A Bangla question about the world — a
+ * place, a price, a score — does not start this way, so it keeps the full
+ * guarded path and its marker-driven lookup.
+ */
+const BANGLA_SIMPLE_OPENER =
+  /^(?:হ্যালো|হাই|কেমন\s*আছ|কেমন\s*আছেন|ভালো\s*আছি|ভাল\s*আছি|ধন্যবাদ|কী\s*খবর|কি\s*খবর|সুপ্রভাত)/;
+
+/** Word ceiling for the Bangla fast lane — a greeting, not a question. */
+const BANGLA_SIMPLE_MAX_WORDS = 5;
+
+/**
+ * Safety-sensitive vocabulary that forces the full path.
+ *
+ * Redundant by design. `classifyRequest` on the server is the authoritative
+ * fail-closed gate and runs before anything else; this second, cheap check
+ * keeps the fast lane conservative even if that gate is ever widened, so a turn
+ * that touches keys, credentials, jailbreaks or harm can never be the one that
+ * skipped a stage.
+ */
+const SENSITIVE_HINT =
+  /\b(?:api|keys?|passwords?|passphrases?|tokens?|secret|credentials?|env|environment|jailbreak|jail\s?break|dan\s+mode|developer\s+mode|god\s+mode|ignore|disregard|override|bypass|system\s+prompt|instructions?|weapons?|bomb|explosives?|gun|knife|kill|murder|suicide|self[-\s]?harm|hurt\s+(?:myself|someone|him|her|them|you)|hate|harass|harassment|nude|nudes|sex|sexual|minor|child|children|overdose|drugs?|meth|cocaine|heroin|poison|terror|terrorist|assault|steal|rob|shoplift|hack|exploit|malware|virus|phishing|scam|blackmail|extort)\b/i;
+
+/** Fold a transcript the way the opener list is written. */
+function foldForOpenerMatch(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}'\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Is this turn small talk that needs nothing beyond the responder?
+ *
+ * Used by `stageRespond` (skip the assist) and by the orchestrator (skip the
+ * rewrite). Pure, deterministic and side-effect free, so it is directly
+ * testable and cannot touch the network.
+ */
+export function isSimpleChatTurn(text: string): boolean {
+  const trimmed = text.trim();
+
+  if (trimmed.length < 2 || trimmed.length > SIMPLE_CHAT_MAX_CHARS) {
+    return false;
+  }
+
+  if (!/[\p{L}\p{N}]/u.test(trimmed)) {
+    return false;
+  }
+
+  // A live ask is never simple, whatever else it looks like.
+  if (detectLiveIntent(trimmed) !== null) {
+    return false;
+  }
+
+  if (SENSITIVE_HINT.test(trimmed)) {
+    return false;
+  }
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+
+  if (words.length > SIMPLE_CHAT_MAX_WORDS) {
+    return false;
+  }
+
+  const folded = foldForOpenerMatch(trimmed);
+
+  if (folded.length === 0) {
+    return false;
+  }
+
+  for (const opener of SIMPLE_CHAT_OPENERS) {
+    if (folded === opener || folded.startsWith(`${opener} `)) {
+      return true;
+    }
+  }
+
+  return (
+    BANGLA_SIMPLE_OPENER.test(folded) && words.length <= BANGLA_SIMPLE_MAX_WORDS
+  );
 }
 
 /**
@@ -596,6 +1133,15 @@ const CAPABILITY_LEAK =
 export function containsCapabilityLeak(text: string): boolean {
   return CAPABILITY_LEAK.test(text);
 }
+
+/**
+ * Live turns cap the SERP retry at TWO attempts inside the shared deadline.
+ *
+ * The provider's own default is three (reject → backoff → reject → backoff →
+ * try); a deterministic LIVE turn knows its query is right, so a second reject
+ * is the answer — burning a third attempt only delayed the honest line.
+ */
+const LIVE_MAX_SEARCH_ATTEMPTS = 2;
 
 /** What this live lookup was actually waiting on. */
 type LiveLookupKind = "time" | "weather" | "search";
@@ -876,7 +1422,8 @@ export async function stageRespond(
   userText: string,
   history: BrainTurn[],
   language: ReplyLanguage = "en",
-  emotion: EmotionHint | null = null
+  emotion: EmotionHint | null = null,
+  onProgress?: BrainProgressCallback
 ): Promise<RespondResult> {
   /*
    * Too-thin transcript (a breath, a stray character): clarify in the locked
@@ -893,40 +1440,47 @@ export async function stageRespond(
   }
 
   /*
-   * The person's own words are classified ONCE, before any model call: the same
-   * verdict arms the backup lookup, decides whether a live turn may ever fall
-   * back to the model's memory, and short-circuits the turn when there is
-   * nothing to look up with.
+   * THE ONE AUTHORITATIVE ROUTING DECISION — CHAT | LIVE | BLOCK.
+   *
+   * `routeTurn` classifies the person's own words ONCE, before any model call:
+   * the same verdict decides whether Bright Data runs BEFORE the responder is
+   * ever asked (LIVE), what the policy gate does (BLOCK — mirrored from
+   * `main-brain.ts`'s fast fail), and which honest fallback a failed lookup
+   * earns. The old shape asked the model FIRST and searched afterwards, which
+   * is where the 12 s draft + 13 s search + 12 s second synthesis worst case
+   * and the "answered from memory" bug both came from.
    */
-  const intentQuery = detectLiveIntent(userText);
-  const asksForLiveFacts = intentQuery !== null;
+  const route = routeTurn(userText, history);
 
-  /*
-   * NOTHING TO LOOK UP WITH.
-   *
-   * With no Bright Data credentials the lookup cannot be attempted at all. When
-   * the person asked for live facts anyway, the model's answer would be a guess
-   * wearing the clothes of news — an invented temperature, an invented score, an
-   * invented clock time. So the turn gets the same ONE honest line a failed
-   * lookup gets, and no model is asked about it.
-   *
-   * Pure chat never reaches this branch: `asksForLiveFacts` is false for
-   * greetings, feelings, jokes, opinions, and anything about the two of us.
-   */
-  if (asksForLiveFacts && !isBrightDataConfigured()) {
-    // Server-side diagnosis: this branch skips Bright Data entirely — no
-    // request ever reaches the dashboard. Logged, never returned to a client.
-    console.log(
-      "[serp]",
-      JSON.stringify({ configured: false, attempted: false, reason: "not-configured" })
-    );
+  if (route.kind === "block") {
     return {
-      reply: lookupUnavailableReply(language, lookupKindFor(userText, userText)),
+      reply: policyReplyFor(route.verdict) ?? INPUT_BLOCKED_REPLY,
       usedSearch: false,
       fastAssist: false,
-      policyBlocked: null,
+      policyBlocked: route.verdict === "allow" ? null : route.verdict,
     };
   }
+
+  /*
+   * THE FAST LANE FLAG, decided once and reused below.
+   *
+   * A simple-chat turn does not need the assist (it would answer `SKIP`) and
+   * does not need the anti-echo rewording (the reply is short, fresh and
+   * already in the responder's own words). The responder still writes it, the
+   * policy gate still screens it, and the guards below still run on it.
+   */
+  const simpleChat = isSimpleChatTurn(userText);
+
+  /*
+   * Turn state, shared by BOTH paths below: the LIVE branch sets it before any
+   * model runs, the CHAT/marker path sets it after. The tail after those
+   * branches (anti-echo, credential, leak and language guards) reads it
+   * unchanged, so every reply — grounded or not — passes the same floor.
+   */
+  let reply: string | null = null;
+  let fastAssist = false;
+  let usedSearch = false;
+  let assistDraft: string | null = null;
 
   const messages: GroqMessage[] = [
     { role: "system", content: systemPrompt(language, emotion) },
@@ -937,19 +1491,142 @@ export async function stageRespond(
     { role: "user", content: userText },
   ];
 
+  /*
+   * ── LIVE ────────────────────────────────────────────────────────────────
+   * intent → Bright Data search → grounded synthesis. The responder is NOT
+   * asked first: a model asked "what's the weather in Dhaka?" before the
+   * lookup answers from memory — and eats 12 s doing it — so for this branch
+   * no model runs until snippets are in hand.
+   *
+   * HONEST FAILURE. If the lookup produces nothing (unconfigured, provider
+   * error, genuinely empty), memory is BANNED outright: no model call, no
+   * assist draft, one honest canned line in the locked language. There is no
+   * path from this branch to a fabricated current fact.
+   */
+  if (route.kind === "live" && route.query !== null) {
+    const lookupKind = route.lookupKind ?? "search";
+
+    if (!isBrightDataConfigured()) {
+      // This branch skips Bright Data entirely — no request reaches the
+      // dashboard. Logged server-side, never returned to a client.
+      console.log(
+        "[serp]",
+        JSON.stringify({
+          configured: false,
+          attempted: false,
+          reason: "not-configured",
+          kind: lookupKind,
+          route: route.reason,
+        })
+      );
+      reply = lookupUnavailableReply(language, lookupKind);
+    } else {
+      onProgress?.({ phase: "searching" });
+      const outcome = await serpSearchDetailed(route.query, BRAIN_TIMEOUTS_MS.search, {
+        lookupKind,
+        // Deterministic LIVE gets a bounded retry: two attempts inside the
+        // shared 13 s deadline, not three — a live turn should not burn its
+        // whole window on gateway rejects.
+        maxAttempts: LIVE_MAX_SEARCH_ATTEMPTS,
+      });
+      const results = outcome.kind === "ok" ? outcome.results : null;
+      onProgress?.({ phase: "searched", found: results !== null });
+
+      if (results === null) {
+        // Diagnosis for the honest line: WHICH class of failure produced it.
+        // Outcome class and lookup kind only — never the query, results or
+        // body — so the speaker hears the honest line and nothing else.
+        console.log(
+          "[serp]",
+          JSON.stringify({
+            attempted: true,
+            outcome: outcome.kind,
+            kind: lookupKind,
+            memoryBanned: true,
+            route: route.reason,
+          })
+        );
+        reply = lookupUnavailableReply(language, lookupKind);
+      } else {
+        /*
+         * THE ONE grounded synthesis — snippets are already in hand, so this
+         * is a single main-model call (no draft-then-rewrite, no assist: an
+         * ungrounded assist draft could only reintroduce the from-memory
+         * answer this branch exists to prevent). The language directive is
+         * stated EXPLICITLY — without it a locked-Bangla live turn came back
+         * in English, which was half of the visible live bug.
+         */
+        const grounded = await groqChat({
+          model: GROQ_MODELS.main,
+          messages: [
+            ...messages,
+            {
+              role: "user",
+              content: [
+                LANGUAGE_DIRECTIVES[language],
+                "Web search results (may be incomplete):",
+                results,
+                "",
+                `The person said: "${userText}"`,
+                "Answer in your own voice, in one to three short spoken sentences.",
+                "Ground every current fact — number, time, temperature, score,",
+                "price, news detail — in these results alone: if they do not show",
+                "it, leave it out rather than guessing.",
+                "Never mention searching, sources or tools.",
+                ...(lookupKind === "time"
+                  ? [
+                      "This is a clock question: state a time ONLY if the results",
+                      "clearly show it for the place asked, with its timezone.",
+                      "If they do not, say you cannot check the clock right now -",
+                      "never guess a time.",
+                    ]
+                  : []),
+              ].join("\n"),
+            },
+          ],
+          temperature: 0.8,
+          maxOutputTokens: BRAIN_TOKEN_BUDGETS.respond,
+          timeoutMs: BRAIN_TIMEOUTS_MS.respond,
+        });
+
+        usedSearch = true;
+
+        if (isSpeakableReply(grounded) && !looksLikeRefusal(grounded)) {
+          reply = grounded;
+        } else {
+          // The lookup worked but the results could not be phrased — the
+          // short "found something" line, never a from-memory substitute.
+          reply = synthesisFailedReply(language);
+        }
+      }
+    }
+  }
+
   // Steps 2 and 3 in flight together. The assist is capped at 800 ms, so a turn
   // completes at max(main, assist) — a bounded fraction of a second, never an
   // open-ended wait on Google.
-  const [mainReply, assistDraft] = await Promise.all([
-    groqChat({
-      model: GROQ_MODELS.main,
-      messages,
-      temperature: 0.8,
-      maxOutputTokens: BRAIN_TOKEN_BUDGETS.respond,
-      timeoutMs: BRAIN_TIMEOUTS_MS.respond,
-    }),
-    stageFastAssist(userText, history),
-  ]);
+  //
+  // Simple chat skips the assist entirely: the contract literally tells it to
+  // answer `SKIP` for greetings, jokes and feelings, so the round trip could
+  // only ever add latency — and a `Promise.resolve(null)` keeps the concurrent
+  // shape of the two branches identical.
+  //
+  // A LIVE turn never reaches this call at all — its reply was already written
+  // from the search results above (or failed honestly before any model ran).
+  const [mainReply, draft] =
+    route.kind === "live"
+      ? ([null, null] as const)
+      : await Promise.all([
+          groqChat({
+            model: GROQ_MODELS.main,
+            messages,
+            temperature: 0.8,
+            maxOutputTokens: BRAIN_TOKEN_BUDGETS.respond,
+            timeoutMs: BRAIN_TIMEOUTS_MS.respond,
+          }),
+          simpleChat ? Promise.resolve(null) : stageFastAssist(userText, history),
+        ]);
+  assistDraft = draft;
 
   /*
    * ROOT CAUSE OF THE "Dhaka" DEAD-END, FIXED HERE.
@@ -965,33 +1642,18 @@ export async function stageRespond(
   const rawMain = typeof mainReply === "string" ? mainReply : null;
 
   /*
-   * TWO ways a turn reaches Bright Data — both handled BEFORE speakability:
+   * THE AMBIGUOUS CLASS — the model's own `[SEARCH: …]` marker.
    *
-   *  1. The model emitted `[SEARCH: …]` (primary, trained by the prompt).
-   *  2. The SERVER detected live intent in the person's own words (backup), for
-   *     when the model answered from memory instead — the "knowledge guess"
-   *     half of the live bug. Armed only when Bright Data is configured; when
-   *     it is NOT, a live ask is answered by the honest line before any model
-   *     call at all (see the early return above).
-   *
-   * Intent, not keywords: `detectLiveIntent` reads freshness domains, clock
-   * questions and explicit lookup verbs behind a chat guard — never a fixed
-   * city or entity list. When a lookup produces NOTHING — whether the ask
-   * came in the person's own words or as the model's own marker — memory is
-   * banned and the turn gets one honest line
-   * in the locked language — no invented weather, news, score, price or time.
+   * LIVE turns were already searched and answered above; THIS marker is the
+   * safety net for the turns the server could not decide: wording no intent
+   * class covers, or a freshness signal a chat guard suppressed (the
+   * `ambiguous` route). When a marker turn produces NOTHING, memory is banned
+   * and the turn gets one honest line in the locked language — no invented
+   * weather, news, score, price or time.
    */
   const markerQuery = rawMain === null ? null : findSearchQuery(rawMain);
-  const searchQuery =
-    markerQuery ?? (isBrightDataConfigured() ? intentQuery : null);
-  /** True when the MODEL asked for this lookup by emitting a marker. */
-  const markerTurn = markerQuery !== null;
 
-  let reply: string | null = null;
-  let fastAssist = false;
-  let usedSearch = false;
-
-  if (searchQuery !== null) {
+  if (markerQuery !== null) {
     /*
      * THE DETAILED OUTCOME, not a collapsed text-or-nothing.
      *
@@ -1005,10 +1667,16 @@ export async function stageRespond(
      */
     let results: string | null = null;
     let outcome: SerpResult | null = null;
+    const markerLookupKind = lookupKindFor(userText, markerQuery);
 
     if (isBrightDataConfigured()) {
-      outcome = await serpSearchDetailed(searchQuery, BRAIN_TIMEOUTS_MS.search);
+      onProgress?.({ phase: "searching" });
+      outcome = await serpSearchDetailed(markerQuery, BRAIN_TIMEOUTS_MS.search, {
+        lookupKind: markerLookupKind,
+        maxAttempts: LIVE_MAX_SEARCH_ATTEMPTS,
+      });
       results = outcome.kind === "ok" ? outcome.results : null;
+      onProgress?.({ phase: "searched", found: results !== null });
     } else {
       // The model raised a marker but the credentials are gone — record it.
       console.log(
@@ -1026,53 +1694,38 @@ export async function stageRespond(
      * WHAT MAY BE ANSWERED FROM MEMORY — AND WHAT MAY NOT.
      *
      * `results === null` means the lookup produced nothing at all: no
-     * credentials, a provider error, or a genuinely empty result set. For any
-     * turn that needed live facts, memory is BANNED outright:
-     *
-     *   - the person asked for live facts (`asksForLiveFacts` — weather, news,
-     *     scores, prices, the time anywhere, "what's happening now", …), and
-     *   - the person asked about the CLOCK (`isClockTurn` — their own words, or
-     *     the English-shaped query the model's marker resolved to), where memory
-     *     can only ever produce an invented time.
-     *
-     * All of them hear ONE honest line in the locked language instead. That is
-     * the whole difference between a companion who says "I can't check right
-     * now" and one who invents tomorrow's forecast — and it holds with Bright
-     * Data unconfigured, which is exactly where the invented weather came from.
-     *
-     * The MODEL's own marker counts the same way: emitting `[SEARCH: …]` IS the
-     * model saying this turn needs current facts — the prompt trains the marker
-     * for exactly that — so a marker turn with no usable results hears the
-     * honest canned line too. It used to fall through to a from-memory answer,
-     * which is where a failed lookup could still fabricate a number, time,
-     * score or story for wording no detector class covered.
+     * credentials, a provider error, or a genuinely empty result set. Emitting
+     * `[SEARCH: …]` IS the model saying this turn needs current facts — the
+     * prompt trains the marker for exactly that — so a marker turn with no
+     * usable results hears ONE honest line in the locked language, whether the
+     * lookup was armed by the person's own words or by the model's marker.
+     * Memory is BANNED: it used to fall through to a from-memory answer, which
+     * is where a failed lookup could still fabricate a number, time, score or
+     * story for wording no detector class covered. (LIVE turns never reach
+     * this code — they failed honestly in the branch above, before any model
+     * ran.)
      */
-    const memoryBanned =
-      results === null &&
-      (markerTurn || asksForLiveFacts || isClockTurn(userText, searchQuery));
+    const memoryBanned = results === null;
 
     if (memoryBanned) {
       /*
        * Server-side diagnosis for the honest line: WHICH class of failure
-       * produced it, and whether it was a clock turn. Carries only the outcome
-       * class and the kind — never the query text, results or body — so the
-       * "flaky live search" report can be read straight off the log while the
-       * speaker hears nothing but the honest line.
+       * produced it. Carries only the outcome class and the kind — never the
+       * query text, results or body — so the "flaky live search" report can be
+       * read straight off the log while the speaker hears nothing but the
+       * honest line.
        */
       console.log(
         "[serp]",
         JSON.stringify({
           attempted: outcome !== null,
           outcome: outcome === null ? "not-attempted" : outcome.kind,
-          kind: lookupKindFor(userText, searchQuery),
+          kind: markerLookupKind,
           memoryBanned: true,
         })
       );
 
-      reply = lookupUnavailableReply(
-        language,
-        lookupKindFor(userText, searchQuery)
-      );
+      reply = lookupUnavailableReply(language, markerLookupKind);
     } else if (results !== null) {
       /*
        * GROUNDED REPLY — snippets only, one to three short spoken sentences.
@@ -1090,6 +1743,7 @@ export async function stageRespond(
           {
             role: "user",
             content: [
+              LANGUAGE_DIRECTIVES[language],
               "Web search results (may be incomplete):",
               results,
               "",
@@ -1099,7 +1753,7 @@ export async function stageRespond(
               "price, news detail — in these results alone: if they do not show",
               "it, leave it out rather than guessing. Same language as your",
               "replies. Never mention searching, sources or tools.",
-              ...(isClockTurn(userText, searchQuery)
+              ...(markerLookupKind === "time"
                 ? [
                     "This is a clock question: state a time ONLY if the results",
                     "clearly show it for the place asked, with its timezone.",
@@ -1135,9 +1789,9 @@ export async function stageRespond(
       reply =
         results !== null
           ? synthesisFailedReply(language)
-          : lookupUnavailableReply(language, lookupKindFor(userText, searchQuery));
+          : lookupUnavailableReply(language, markerLookupKind);
     }
-  } else {
+  } else if (route.kind !== "live") {
     reply = isSpeakableReply(rawMain) ? rawMain : null;
 
     /*
@@ -1171,6 +1825,17 @@ export async function stageRespond(
   }
 
   /*
+   * Every path above ends with a reply — the chat rescue already throws when
+   * it cannot make one, and the LIVE branch always sets an honest line or a
+   * grounded draft. This guard is the belt-and-braces that lets the tail below
+   * run on a definite string (and lands in `runMainBrain`'s catch-all if a
+   * path ever regresses).
+   */
+  if (reply === null) {
+    throw new Error("respond-failed");
+  }
+
+  /*
    * ANTI-ECHO, CHAT ONLY.
    *
    * The person is talking to a friend, not reading a template, and the prompt's
@@ -1182,13 +1847,16 @@ export async function stageRespond(
    *
    * Search-grounded replies are deliberately excluded: the wording there carries
    * facts (a time, a temperature, a score) that a rewording pass could blur, and
-   * a live answer is already fresh by construction.
+   * a live answer is already fresh by construction. Simple chat is excluded too:
+   * "hey, how's it going?" and its answer are the shortest turns in the loop, and
+   * a second responder call to re-open them would cost more than it fixes.
    */
   const previousLine = lastAssistantLine(history);
 
   if (
     previousLine !== null &&
     !usedSearch &&
+    !simpleChat &&
     !isCannedReply(reply) &&
     echoesLastReply(reply, previousLine)
   ) {

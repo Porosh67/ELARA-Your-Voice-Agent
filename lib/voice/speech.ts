@@ -39,14 +39,93 @@ export function isSpeechSynthesisSupported(): boolean {
 }
 
 /**
+ * HOW LONG A SPEECH ATTEMPT MAY WAIT FOR THE VOICE LIST.
+ *
+ * Long enough for a cold platform list to land, short enough that a reply is
+ * never held back by it. `warmupVoices()` is what makes this cap safe: the list
+ * is normally already cached before the first reply exists.
+ */
+const VOICE_WAIT_MS = 300;
+
+/**
+ * THE CACHED VOICE LIST — warmed once, refreshed on `voiceschanged`.
+ *
+ * Chromium exposes `getVoices()` as empty until `voiceschanged` fires, so an
+ * earlier version awaited the list on EVERY reply — up to a second of silence
+ * between "thinking" and the first word, on every single turn. The list is a
+ * property of the device, not of the reply, so it is read once (as early as the
+ * voice console mounts) and re-read whenever the platform says it changed.
+ */
+let cachedVoices: SpeechSynthesisVoice[] | null = null;
+/** True once a `voiceschanged` listener has been attached, so it is never doubled. */
+let listeningForVoices = false;
+/** Language tag → resolved voice + match result. Cleared whenever the list changes. */
+const resolvedVoiceCache = new Map<
+  string,
+  { voice: SpeechSynthesisVoice | null; matched: boolean }
+>();
+
+/** Read the platform list, storing it when the platform actually has entries. */
+function readVoices(): SpeechSynthesisVoice[] {
+  if (!isSpeechSynthesisSupported()) {
+    return [];
+  }
+
+  const voices = window.speechSynthesis.getVoices();
+
+  if (voices.length > 0) {
+    cachedVoices = voices;
+  }
+
+  return voices;
+}
+
+/**
+ * Warm the voice list BEFORE the first reply needs it.
+ *
+ * Safe to call at any time, from anywhere, as often as you like: it never
+ * throws, never speaks, and never waits. Called when the voice console mounts
+ * and when a session starts, so the cost is paid while the person is still
+ * deciding to talk instead of after Elara has something to say.
+ */
+export function warmupVoices(): void {
+  if (!isSpeechSynthesisSupported()) {
+    return;
+  }
+
+  if (readVoices().length > 0) {
+    return;
+  }
+
+  if (listeningForVoices) {
+    return;
+  }
+
+  listeningForVoices = true;
+
+  window.speechSynthesis.addEventListener("voiceschanged", () => {
+    // A new list invalidates every resolved language → voice decision.
+    resolvedVoiceCache.clear();
+    readVoices();
+  });
+}
+
+/**
  * Waits briefly for the platform voice list to populate.
  *
- * Chromium exposes `getVoices()` as empty until `voiceschanged` fires, and on
- * some platforms it never fires at all — so this always resolves.
+ * Resolves immediately from the cache when it is warm; otherwise waits for
+ * `voiceschanged` (or the timeout) exactly as before. Always resolves, because
+ * on some platforms the event never fires at all.
  */
-function waitForVoices(timeoutMs = 1000): Promise<SpeechSynthesisVoice[]> {
+function waitForVoices(timeoutMs = VOICE_WAIT_MS): Promise<SpeechSynthesisVoice[]> {
+  const cached = cachedVoices;
+
+  if (cached !== null && cached.length > 0) {
+    return Promise.resolve(cached);
+  }
+
   return new Promise((resolve) => {
-    const existing = window.speechSynthesis.getVoices();
+    const existing = readVoices();
     if (existing.length > 0) {
       resolve(existing);
       return;
@@ -60,12 +139,56 @@ function waitForVoices(timeoutMs = 1000): Promise<SpeechSynthesisVoice[]> {
       }
       settled = true;
       window.speechSynthesis.removeEventListener("voiceschanged", finish);
-      resolve(window.speechSynthesis.getVoices());
+      resolve(readVoices());
     };
 
     window.speechSynthesis.addEventListener("voiceschanged", finish);
     window.setTimeout(finish, timeoutMs);
   });
+}
+
+/**
+ * The list to resolve a voice against, without an open-ended wait.
+ *
+ * `speak()` uses this: a warm cache means no wait at all, and a cold one means
+ * one bounded wait — never the full second the old first-reply path paid.
+ */
+async function voicesForSpeech(): Promise<SpeechSynthesisVoice[]> {
+  const cached = cachedVoices;
+
+  if (cached !== null && cached.length > 0) {
+    return cached;
+  }
+
+  return waitForVoices(VOICE_WAIT_MS);
+}
+
+/**
+ * `resolveVoice` with a per-language memo.
+ *
+ * The device's voice list does not change between replies, so scanning it for
+ * the same tag on every turn was pure repeated work. Only positive matches are
+ * cached: an unmatched tag is re-checked, because the platform may still be
+ * loading the list.
+ */
+function resolveVoiceCached(
+  voices: SpeechSynthesisVoice[],
+  lang: string
+): { voice: SpeechSynthesisVoice | null; matched: boolean } {
+  const key = lang.toLowerCase();
+  const hit = resolvedVoiceCache.get(key);
+
+  if (hit !== undefined) {
+    return hit;
+  }
+
+  const resolved = resolveVoice(voices, lang);
+
+  if (voices.length > 0) {
+    resolvedVoiceCache.set(key, resolved);
+  }
+
+  return resolved;
 }
 
 /**
@@ -117,8 +240,11 @@ export async function hasVoiceForLanguage(lang: string): Promise<boolean> {
     return false;
   }
 
-  const voices = await waitForVoices();
-  return resolveVoice(voices, lang).matched;
+  // The notice is passive, so this may take its time: a warm cache answers
+  // instantly, and a cold one waits the full window rather than reporting a
+  // missing voice that is merely still loading.
+  const voices = await waitForVoices(1000);
+  return resolveVoiceCached(voices, lang).matched;
 }
 
 /** Stops anything currently being spoken. Safe to call at any time. */
@@ -239,8 +365,8 @@ export async function speak({
   // Never let two replies overlap.
   synthesis.cancel();
 
-  const voices = await waitForVoices();
-  const resolved = resolveVoice(voices, lang);
+  const voices = await voicesForSpeech();
+  const resolved = resolveVoiceCached(voices, lang);
   const prosody = emotion === null ? null : EMOTION_PROSODY[emotion];
   const resolvedRate = rate ?? prosody?.rate ?? 1;
   const resolvedPitch = pitch ?? prosody?.pitch ?? 1;

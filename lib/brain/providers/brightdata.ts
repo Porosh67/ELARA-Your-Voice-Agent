@@ -4,8 +4,11 @@ import { getBrightDataSerpToken, getBrightDataSerpZone } from "@/lib/brain/env";
 
 /**
  * Bright Data SERP search. Returns formatted result snippets, or `null` when
- * the integration isn't configured or fails — the main model then answers from
- * its own knowledge and the voice loop never notices.
+ * the integration isn't configured or fails — the caller then chooses: LIVE
+ * turns speak ONE honest canned line (memory is banned for current facts),
+ * while the model's `[SEARCH: …]` marker path falls back the same way. No
+ * failure ever turns into a fabricated current fact, and the voice loop never
+ * dies on a lookup.
  */
 
 const BRIGHT_DATA_REQUEST_URL = "https://api.brightdata.com/request";
@@ -54,6 +57,26 @@ function wrappedBodyEmpty(payload: unknown): boolean {
 }
 
 /**
+ * Options for one lookup attempt cycle. Nothing here changes the REQUEST
+ * (payload, zone, format and Light header are untouched) — only how the
+ * caller's deadline is spent and what the log line carries.
+ */
+export interface SerpLookupOptions {
+  /**
+   * Which honest line a failure earns upstream ("time" | "weather" |
+   * "search"). Echoed into every `[serp]` log line as `kind` — a word, never
+   * the query itself.
+   */
+  lookupKind?: "time" | "weather" | "search";
+  /**
+   * Attempt cap inside the shared deadline. Default 3 (the provider's
+   * reject-retry behaviour); deterministic LIVE passes 2 so a flaky gateway
+   * cannot burn the whole window before the honest line.
+   */
+  maxAttempts?: number;
+}
+
+/**
  * Runs one SERP query and reports WHY it ended the way it did.
  *
  * The reason reaches the person: "unavailable" (no credentials) and "empty"
@@ -75,13 +98,25 @@ function wrappedBodyEmpty(payload: unknown): boolean {
  */
 export async function serpSearchDetailed(
   query: string,
-  timeoutMs: number
+  timeoutMs: number,
+  options: SerpLookupOptions = {}
 ): Promise<SerpResult> {
   const token = getBrightDataSerpToken();
   const zone = getBrightDataSerpZone();
 
+  /*
+   * Every log line below goes through this wrapper so `kind` (the honest-line
+   * class the caller expects) is stamped once, centrally. The entry itself is
+   * still built by the caller — and, as before, may carry ONLY statuses,
+   * timing, counts, shape and outcome: never the token, the zone value, the
+   * query text or a response body.
+   */
+  const log = (entry: Record<string, unknown>): void =>
+    logSearch({ kind: options.lookupKind, ...entry });
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 3);
+
   if (!token || !zone || query.trim().length === 0) {
-    logSearch({
+    log({
       configured: { token: token.length > 0, zone: zone.length > 0 },
       attempted: false,
       reason: query.trim().length === 0 ? "empty-query" : "not-configured",
@@ -118,6 +153,12 @@ export async function serpSearchDetailed(
   let lastFault: "timeout" | "error" = "error";
 
   for (let attempt = 0; ; attempt += 1) {
+    // Attempt cap (LIVE passes 2): two rejects are the answer — do not burn
+    // the rest of the shared deadline on a third try before the honest line.
+    if (attempt >= maxAttempts) {
+      break;
+    }
+
     if (attempt > 0) {
       const remainingBeforeWait = deadline - Date.now();
 
@@ -168,7 +209,7 @@ export async function serpSearchDetailed(
 
       if (!response.ok) {
         // Status only — never the body, which could echo the query URL.
-        logSearch({
+        log({
           attempted: true,
           http: response.status,
           ms,
@@ -193,7 +234,7 @@ export async function serpSearchDetailed(
       const brdStatus = gatewayStatus(payload);
 
       if (brdStatus !== null && brdStatus !== 200) {
-        logSearch({
+        log({
           attempted: true,
           http: 200,
           brd: brdStatus,
@@ -206,32 +247,50 @@ export async function serpSearchDetailed(
         continue;
       }
 
-      const organic = extractOrganicResults(payload);
+      const parsed = extractOrganicResults(payload);
+      const organic = parsed.lines;
+      // Parser diagnostics: WHICH accepted shape the payload had, and whether
+      // it yielded anything — enough to tell "zone answered in an unexpected
+      // shape" apart from "the SERP really was empty", with no body logged.
+      const shape = parsed.shape;
+      const parser = organic.length > 0 ? "ok" : "none";
 
       if (organic.length === 0) {
         // A 200 wrapper around a blank body is a failed fetch, not an empty
         // result set — retry it like the reject above.
         if (wrappedBodyEmpty(payload)) {
-          logSearch({
+          log({
             attempted: true,
             http: 200,
             ms,
             attempt,
+            shape,
+            parser,
             outcome: "empty-body",
           });
           lastFault = "error";
           continue;
         }
 
-        logSearch({ attempted: true, http: 200, ms, attempt, outcome: "empty" });
+        log({
+          attempted: true,
+          http: 200,
+          ms,
+          attempt,
+          shape,
+          parser,
+          outcome: "empty",
+        });
         return { kind: "empty" };
       }
 
-      logSearch({
+      log({
         attempted: true,
         http: 200,
         ms,
         attempt,
+        shape,
+        parser,
         outcome: "ok",
         results: organic.length,
       });
@@ -249,13 +308,13 @@ export async function serpSearchDetailed(
       const errorClass =
         name === "TimeoutError" || name === "AbortError" ? "timeout" : "network";
       lastFault = errorClass === "timeout" ? "timeout" : "error";
-      logSearch({ attempted: true, ms, attempt, outcome: lastFault, errorClass });
+      log({ attempted: true, ms, attempt, outcome: lastFault, errorClass });
     }
   }
 
   // Deadline exhausted on rejects/errors — honest "provider unhappy" outcome,
   // reported as `timeout` when the budget was burned by aborted fetches.
-  logSearch({
+  log({
     attempted: true,
     ms: Date.now() - startedAt,
     http: lastHttp,
@@ -286,51 +345,142 @@ function parseJsonOrNull(text: string): unknown {
   }
 }
 
+/** What the parser found, and the SHAPE it was found in (diagnostics only). */
+export interface OrganicExtraction {
+  /** Title + snippet lines the synthesizer will be grounded on. */
+  lines: string[];
+  /**
+   * Which accepted payload shape produced `lines` — "array", "object-organic",
+   * "object-results", "object-wrapped:…", "object-answer", "body-json:…",
+   * "body-html", or a miss shape ("unparseable-string", "non-object",
+   * "object-empty"). Logged as `shape` so an unexpected zone configuration is
+   * visible from the server log WITHOUT ever logging the body itself.
+   */
+  shape: string;
+}
+
 /**
- * Bright Data's SERP shape varies by zone configuration. Three shapes are
- * accepted, so a configuration difference degrades into "no results" at
- * worst - never into a crash on the critical path:
+ * Bright Data's SERP shape varies by zone configuration. Three base shapes
+ * (plus two conservative extensions) are accepted, so a configuration
+ * difference degrades into "no results" at worst - never into a crash on the
+ * critical path:
  *   1. an array of result objects,
- *   2. an object carrying an `organic` (or `results`) array,
+ *   2. an object carrying an `organic` (or `results`) array — plain, or
+ *      object-wrapped one level down (`{ organic: { organic: [...] } }`),
  *   3. an object whose `body` holds the page as JSON text or as raw HTML.
+ * Extensions (conservative — keys seen in parsed-light answers):
+ *   4. a featured-answer block (`general` / `answer` / `light_answer`) when no
+ *      organic list exists,
+ *   5. a bare `url` / `link` when a result object has neither title nor
+ *      snippet.
+ *
+ * Exported so the regression battery can verify the parser directly against
+ * representative payloads — the request shape itself is validated in tests,
+ * never changed here.
  */
-function extractOrganicResults(payload: unknown): string[] {
+export function extractOrganicResults(payload: unknown): OrganicExtraction {
   const decoded = typeof payload === "string" ? parseJsonOrNull(payload) : payload;
 
   if (decoded === null) {
-    return [];
+    return {
+      lines: [],
+      shape: typeof payload === "string" ? "unparseable-string" : "unparseable",
+    };
   }
 
   if (Array.isArray(decoded)) {
-    return collectFromArray(decoded);
+    return { lines: collectFromArray(decoded), shape: "array" };
   }
 
   if (typeof decoded !== "object") {
-    return [];
+    return { lines: [], shape: "non-object" };
   }
 
   const record = decoded as {
     organic?: unknown;
     results?: unknown;
+    general?: unknown;
+    answer?: unknown;
+    light_answer?: unknown;
     body?: unknown;
   };
 
   const results: string[] = [];
+  let shape: string | null = null;
 
-  for (const candidate of [record.organic, record.results]) {
+  for (const [key, candidate] of [
+    ["organic", record.organic],
+    ["results", record.results],
+  ] as const) {
     if (Array.isArray(candidate)) {
       results.push(...collectFromArray(candidate));
+      shape ??= `object-${key}`;
+    } else if (typeof candidate === "object" && candidate !== null) {
+      // Object-wrapped list one level down — recurse, keep it bounded by the
+      // payload's own structure (JSON cannot self-reference).
+      const wrapped = extractOrganicResults(candidate);
+
+      if (wrapped.lines.length > 0) {
+        results.push(...wrapped.lines);
+        shape ??= `object-wrapped:${wrapped.shape}`;
+      }
+    }
+  }
+
+  // A featured-answer block, used only when no organic list carried anything.
+  if (results.length === 0) {
+    for (const answer of [record.general, record.answer, record.light_answer]) {
+      const line = answerLine(answer);
+
+      if (line.length > 0) {
+        results.push(line);
+        shape = "object-answer";
+        break;
+      }
     }
   }
 
   if (results.length === 0 && typeof record.body === "string") {
     const inner = parseJsonOrNull(record.body);
-    return inner !== null
-      ? extractOrganicResults(inner)
-      : collectLooseText(record.body);
+
+    if (inner !== null) {
+      const wrapped = extractOrganicResults(inner);
+      return { lines: wrapped.lines, shape: `body-json:${wrapped.shape}` };
+    }
+
+    return { lines: collectLooseText(record.body), shape: "body-html" };
   }
 
-  return results;
+  return { lines: results, shape: shape ?? "object-empty" };
+}
+
+/** Title/snippet text from a featured-answer block, or `""`. */
+function answerLine(answer: unknown): string {
+  if (typeof answer === "string") {
+    return answer.trim().slice(0, 300);
+  }
+
+  if (typeof answer !== "object" || answer === null) {
+    return "";
+  }
+
+  const record = answer as {
+    title?: unknown;
+    description?: unknown;
+    snippet?: unknown;
+    text?: unknown;
+  };
+  const title = typeof record.title === "string" ? record.title : "";
+  const snippet =
+    typeof record.description === "string"
+      ? record.description
+      : typeof record.snippet === "string"
+        ? record.snippet
+        : typeof record.text === "string"
+          ? record.text
+          : "";
+
+  return [title, snippet].filter(Boolean).join(" - ").trim().slice(0, 300);
 }
 
 /** Title + snippet lines from an array of SERP result objects. */
@@ -346,6 +496,8 @@ function collectFromArray(entries: unknown[]): string[] {
       title?: unknown;
       description?: unknown;
       snippet?: unknown;
+      url?: unknown;
+      link?: unknown;
     };
 
     const title = typeof record.title === "string" ? record.title : "";
@@ -360,6 +512,21 @@ function collectFromArray(entries: unknown[]): string[] {
 
     if (line.length > 0) {
       results.push(line.slice(0, 300));
+      continue;
+    }
+
+    // Last resort: some zone shapes answer with only a link. A bare URL is a
+    // poor snippet but a real, verifiable fact — better than dropping the
+    // result entirely.
+    const url =
+      typeof record.url === "string"
+        ? record.url
+        : typeof record.link === "string"
+          ? record.link
+          : "";
+
+    if (url.length > 0) {
+      results.push(url.slice(0, 300));
     }
   }
 

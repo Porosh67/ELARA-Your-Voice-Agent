@@ -19,6 +19,15 @@ import { sttConfigurationMessage } from "@/lib/voice/keyterms";
 const STREAMING_WS_BASE = "wss://streaming.assemblyai.com/v3/ws";
 const PCM_ENCODING = "pcm_s16le";
 /**
+ * BOUNDED HANDSHAKE — how long the socket may take to confirm the session.
+ *
+ * The open + `Begin` round trip is normally well under a second, but a hung
+ * handshake used to leave the UI on "connecting" indefinitely, with a manual
+ * Stop as the only way out. Eight seconds is generous for a slow mobile
+ * connection and still bounded.
+ */
+const CONNECT_TIMEOUT_MS = 8000;
+/**
  * Below this, a reported `language_code` is not treated as evidence.
  *
  * The report is an inference about what was said, so a shaky one must never
@@ -48,6 +57,8 @@ export interface ConnectOptions {
   /** AssemblyAI streaming model id, resolved from the language lock. */
   speechModel: string;
   callbacks: AssemblyAiStreamCallbacks;
+  /** Override for the bounded handshake (defaults to CONNECT_TIMEOUT_MS). */
+  timeoutMs?: number;
 }
 
 /** Map a close code to something a user can act on. */
@@ -90,6 +101,7 @@ export class AssemblyAiStream {
    */
   connect(options: ConnectOptions): Promise<void> {
     const { token, sampleRate, speechModel, callbacks } = options;
+    const timeoutMs = options.timeoutMs ?? CONNECT_TIMEOUT_MS;
 
     this.callbacks = callbacks;
     this.closingIntentionally = false;
@@ -117,6 +129,28 @@ export class AssemblyAiStream {
 
     return new Promise<void>((resolve, reject) => {
       let socket: WebSocket;
+      let timer: number | null = null;
+
+      const clearTimer = () => {
+        if (timer !== null) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+      };
+
+      /*
+       * Every settlement clears the handshake timer, so a session that opened
+       * (or failed) on its own never gets a late "timed out" afterwards.
+       */
+      const settleResolve = () => {
+        clearTimer();
+        resolve();
+      };
+
+      const settleReject = (error: Error) => {
+        clearTimer();
+        reject(error);
+      };
 
       try {
         socket = new WebSocket(`${STREAMING_WS_BASE}?${params.toString()}`);
@@ -129,8 +163,26 @@ export class AssemblyAiStream {
       this.socket = socket;
       socket.binaryType = "arraybuffer";
 
+      timer = window.setTimeout(() => {
+        if (this.failed || this.sessionReady) {
+          return;
+        }
+
+        this.failed = true;
+        const message = "Voice connection timed out. Please try again.";
+        callbacks.onError(message);
+
+        try {
+          socket.close();
+        } catch {
+          // Already gone — nothing left to close.
+        }
+
+        settleReject(new Error(message));
+      }, timeoutMs);
+
       socket.onmessage = (event: MessageEvent<string>) => {
-        this.handleMessage(event, resolve, reject);
+        this.handleMessage(event, settleResolve, settleReject);
       };
 
       socket.onerror = () => {
@@ -140,13 +192,20 @@ export class AssemblyAiStream {
         this.failed = true;
         const message = "Voice connection error. Please try again.";
         callbacks.onError(message);
-        reject(new Error(message));
+        settleReject(new Error(message));
       };
 
       socket.onclose = (event: CloseEvent) => {
+        clearTimer();
         this.socket = null;
 
         if (this.closingIntentionally) {
+          /*
+           * A deliberate Stop mid-handshake settles the promise as well. It used
+           * to be left pending, so the `await` inside the caller never finished
+           * and the half-open attempt stayed on the stack until GC.
+           */
+          settleResolve();
           callbacks.onClose?.();
           return;
         }
@@ -156,7 +215,7 @@ export class AssemblyAiStream {
           callbacks.onError(describeCloseCode(event.code));
         }
 
-        reject(new Error("Socket closed before the session was ready"));
+        settleReject(new Error("Socket closed before the session was ready"));
       };
     });
   }

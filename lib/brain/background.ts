@@ -23,6 +23,17 @@ import type { BrainTurn } from "@/lib/brain/types";
 const MAX_EMBEDDINGS_PER_USER = 50;
 const MAX_LONG_CONTEXT_TURNS = 12;
 
+/**
+ * Hard cap on how many users are remembered at once.
+ *
+ * Each user's per-user list is already bounded, but the number of USERS was
+ * not — so on a long-lived instance (and anonymous sign-ins mint a fresh
+ * `userId` for free) these Maps could grow without limit. This mirrors the
+ * rate limiter's own `MAX_TRACKED_KEYS` bound. It is deliberately a cap, not a
+ * store: memory here is process-local and is meant to be dropped.
+ */
+const MAX_TRACKED_USERS = 5_000;
+
 interface MemoryEntry {
   vector: number[];
   at: number;
@@ -41,6 +52,31 @@ function pushBounded<T>(list: T[], entry: T, cap: number): T[] {
   return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
+/**
+ * Record that `userId` is active, bounding the total number of tracked users.
+ *
+ * `Map.set` on an existing key does NOT reorder it, so this evicts the
+ * first-inserted key rather than the least-recently-used one. That is
+ * sufficient: the goal is a memory bound, not perfect LRU accuracy.
+ */
+function touchUser(userId: string): void {
+  if (embeddings.has(userId)) {
+    // Refresh recency in place without adding an empty list.
+    embeddings.set(userId, embeddings.get(userId) ?? []);
+    return;
+  }
+
+  if (embeddings.size >= MAX_TRACKED_USERS) {
+    const oldest = embeddings.keys().next().value;
+
+    if (oldest !== undefined && oldest !== userId) {
+      embeddings.delete(oldest);
+      qualityScores.delete(oldest);
+      summaries.delete(oldest);
+    }
+  }
+}
+
 async function embedRemember(userId: string, userText: string): Promise<void> {
   const vector = await googleEmbed({
     model: GOOGLE_MODELS.embedding,
@@ -49,6 +85,7 @@ async function embedRemember(userId: string, userText: string): Promise<void> {
   });
 
   if (vector) {
+    touchUser(userId);
     embeddings.set(
       userId,
       pushBounded(embeddings.get(userId) ?? [], { vector, at: Date.now() }, MAX_EMBEDDINGS_PER_USER)
@@ -123,6 +160,9 @@ export async function runBrainBackground(
   turns: BrainTurn[]
 ): Promise<void> {
   const tasks: Promise<void>[] = [];
+
+  // Enforce the tracked-user bound before any step can add a new key.
+  touchUser(userId);
 
   if (isGoogleAiConfigured()) {
     tasks.push(embedRemember(userId, userText));

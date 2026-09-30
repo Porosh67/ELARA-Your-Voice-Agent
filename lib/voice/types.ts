@@ -1,9 +1,9 @@
 /**
  * Shared voice types.
  *
- * The six status states below are the complete state machine for the Day-1
+ * The eight status states below are the complete state machine for the Day-1
  * voice loop. Keeping them as a closed union means every UI surface that
- * renders voice state must handle all six.
+ * renders voice state must handle all eight.
  */
 export type VoiceStatus =
   /** Mic off, no session. */
@@ -14,6 +14,17 @@ export type VoiceStatus =
   | "listening"
   /** Final transcript received; reply is being prepared (stub for now). */
   | "thinking"
+  /**
+   * A LIVE turn's pre-model Bright Data lookup is in flight — the server sent
+   * a `searching` progress event. The person sees "Searching live…".
+   */
+  | "searching"
+  /**
+   * Live results are in hand — the server sent `searched` with `found: true`
+   * and is now writing the grounded reply. The person sees "Found live
+   * results". A failed lookup (`found: false`) returns to `thinking`.
+   */
+  | "search-found"
   /** SpeechSynthesis is reading the reply aloud. */
   | "speaking"
   /** Anything went wrong — message explains what. */

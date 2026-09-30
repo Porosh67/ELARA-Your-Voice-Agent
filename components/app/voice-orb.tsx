@@ -1,7 +1,8 @@
 "use client";
 
+import { memo } from "react";
 import { motion } from "motion/react";
-import { AlertCircle, AudioLines, Mic, Sparkles } from "lucide-react";
+import { AlertCircle, AudioLines, Mic, Search, SearchCheck, Sparkles } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useReducedMotion } from "@/hooks/useReducedMotion";
 import { cn } from "@/lib/utils";
@@ -19,10 +20,17 @@ import type { VoiceStatus } from "@/lib/voice/types";
  *   connecting — a comet of brand light circling the rim
  *   listening  — sonar rings expanding outward
  *   thinking   — a single quiet arc sweeping the rim
+ *   searching  — a single sweeping arc (amber, like thinking)
+ *   search-found — a calm arc (emerald, like speaking)
  *   speaking   — waveform bars with a slow comet behind them
  *   error      — still, with a warm red bloom
  *
  * Reduced motion strips every moving layer down to its static equivalent.
+ *
+ * Rendered through `memo`: the console re-renders on every finalized turn and
+ * status change, and the orb's props are stable across those renders — so a
+ * memoized orb skips the whole layered animation tree unless `status`,
+ * `isActive`, `disabled` or the (stable) toggle handler actually changed.
  */
 
 /** Relative bar heights for the "speaking" waveform inside the core. */
@@ -54,7 +62,7 @@ interface OrbVisual {
   breathes: boolean;
 }
 
-/** One visual per state, so all six states are covered by construction. */
+/** One visual per state, so all eight states are covered by construction. */
 const ORB_VISUALS: Record<VoiceStatus, OrbVisual> = {
   idle: {
     Icon: Mic,
@@ -96,6 +104,26 @@ const ORB_VISUALS: Record<VoiceStatus, OrbVisual> = {
     comet: false,
     breathes: false,
   },
+  searching: {
+    Icon: Search,
+    bloom: "bg-amber-500/15",
+    ring: "border-amber-500/40",
+    tone: "text-amber-600 dark:text-amber-300",
+    sonar: false,
+    sweep: true,
+    comet: false,
+    breathes: false,
+  },
+  "search-found": {
+    Icon: SearchCheck,
+    bloom: "bg-emerald-500/15",
+    ring: "border-emerald-500/40",
+    tone: "text-emerald-600 dark:text-emerald-300",
+    sonar: false,
+    sweep: true,
+    comet: false,
+    breathes: true,
+  },
   speaking: {
     Icon: AudioLines,
     bloom: "bg-emerald-500/15",
@@ -127,7 +155,7 @@ interface VoiceOrbProps {
   disabled?: boolean;
 }
 
-export function VoiceOrb({
+function VoiceOrbComponent({
   status,
   isActive,
   onToggle,
@@ -313,3 +341,10 @@ export function VoiceOrb({
     </div>
   );
 }
+
+/**
+ * Memoized so a console re-render (a new turn, a status flip, a partial
+ * revision) does not rebuild the orb's layered animation tree unless the orb's
+ * own props have changed.
+ */
+export const VoiceOrb = memo(VoiceOrbComponent);

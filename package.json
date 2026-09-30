@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:live-search": "node --import ./scripts/test-hooks.mjs scripts/live-search-regression.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

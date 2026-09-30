@@ -192,6 +192,19 @@ export function classifyRequest(text: string): PolicyVerdict {
   return "allow";
 }
 
+/**
+ * Injection-shaped text only, with no other policy label involved.
+ *
+ * Used to screen UNTRUSTABLE, client-supplied conversation history before it is
+ * interpolated into a model prompt. `classifyRequest` cannot serve that purpose
+ * directly: history is not a user request, and applying the full classifier to
+ * it would poison the conversation with refusals for turns the user never typed.
+ * Reusing the same constant keeps a single definition of "injection shape".
+ */
+export function containsInjectionAttempt(text: string): boolean {
+  return INJECTION_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
    Output side — credential leakage
    ────────────────────────────────────────────────────────────────────────── */

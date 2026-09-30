@@ -103,6 +103,16 @@ export function describeMicrophoneError(error: unknown): string {
  *   ...
  *   recorder.stop();
  */
+/**
+ * Thrown by `PcmRecorder.start()` when a `stop()` landed while the microphone
+ * or the audio graph was still being acquired.
+ *
+ * Exported so a caller can tell "the person stopped the session" apart from a
+ * real capture failure — a cancelled start is not an error worth showing.
+ */
+export const MICROPHONE_CANCELLED_MESSAGE = "Microphone capture was cancelled.";
+
+/** One instance per session. */
 export class PcmRecorder {
   private stream: MediaStream | null = null;
   private context: AudioContext | null = null;
@@ -121,6 +131,13 @@ export class PcmRecorder {
    * speakers (that would be an echo/feedback loop for the user).
    */
   private muteNode: GainNode | null = null;
+  /**
+   * Set by `stop()`. Checked after every await inside `start()`, so a session
+   * that was stopped while the permission prompt or the worklet module was
+   * still pending releases everything it acquires instead of leaving a live
+   * microphone behind with nothing listening to it.
+   */
+  private stopped = false;
 
   constructor(private readonly callbacks: PcmRecorderCallbacks) {}
 
@@ -135,6 +152,8 @@ export class PcmRecorder {
     if (typeof window === "undefined") {
       throw new Error("Microphone capture is browser-only.");
     }
+
+    this.stopped = false;
 
     if (!window.isSecureContext) {
       throw new Error(describeMicrophoneError({ name: "SecurityError" }));
@@ -158,6 +177,8 @@ export class PcmRecorder {
       throw new Error(describeMicrophoneError(error));
     }
 
+    this.releaseIfStopped();
+
     // Some browsers refuse an explicit sample rate; fall back to their default
     // rather than failing the whole session. The true rate is reported back
     // below, so the stream stays in sync either way.
@@ -175,6 +196,8 @@ export class PcmRecorder {
       await context.resume();
     }
 
+    this.releaseIfStopped();
+
     this.source = context.createMediaStreamSource(this.stream);
     this.chunker = new PcmFrameChunker(context.sampleRate);
 
@@ -190,7 +213,23 @@ export class PcmRecorder {
       this.attachScriptProcessor(context);
     }
 
+    this.releaseIfStopped();
+
     return context.sampleRate;
+  }
+
+  /**
+   * Release everything and abort the start when a `stop()` arrived mid-flight.
+   *
+   * Called after each await in `start()`: without it, a Stop that landed during
+   * the permission prompt left the granted microphone open — the browser's
+   * recording indicator on, and no recognizer to send the audio to.
+   */
+  private releaseIfStopped(): void {
+    if (this.stopped) {
+      this.stop();
+      throw new Error(MICROPHONE_CANCELLED_MESSAGE);
+    }
   }
 
   private async attachWorklet(context: AudioContext): Promise<void> {
@@ -210,7 +249,7 @@ export class PcmRecorder {
     }
 
     // The recorder may have been stopped while the module was loading.
-    if (!this.source || this.context?.state === "closed") {
+    if (this.stopped || !this.source || this.context?.state === "closed") {
       this.teardownWorklet();
       return;
     }
@@ -314,6 +353,10 @@ export class PcmRecorder {
 
   /** Idempotent. Stops the mic track and releases every audio resource. */
   stop(): void {
+    // Recorded FIRST: a `start()` still awaiting the permission prompt or the
+    // worklet module sees this and releases whatever it holds.
+    this.stopped = true;
+
     if (this.scriptNode) {
       this.scriptNode.onaudioprocess = null;
       this.scriptNode.disconnect();

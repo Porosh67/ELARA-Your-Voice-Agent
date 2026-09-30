@@ -19,11 +19,11 @@ import {
   shouldEscalateToBangla,
   wantsEnglishOnly,
 } from "@/lib/voice/language-lock";
-import { PcmRecorder } from "@/lib/voice/pcm-recorder";
-import { speak, stopSpeaking } from "@/lib/voice/speech";
+import { MICROPHONE_CANCELLED_MESSAGE, PcmRecorder } from "@/lib/voice/pcm-recorder";
+import { speak, stopSpeaking, warmupVoices } from "@/lib/voice/speech";
 import { requestBrainReply } from "@/lib/brain/brain-client";
 import { isCannedReply } from "@/lib/brain/types";
-import type { BrainTurn } from "@/lib/brain/types";
+import type { BrainProgress, BrainTurn } from "@/lib/brain/types";
 import { isVoiceLanguageCode } from "@/lib/voice/types";
 import type {
   TranscriptTurn,
@@ -35,6 +35,11 @@ import type {
  * Orchestrates the voice loop:
  *
  *   idle → connecting → listening → thinking → speaking → listening → …
+ *
+ * A LIVE turn inserts two extra states between `thinking` and `speaking`:
+ * `searching` (the server's pre-model Bright Data lookup is in flight) and
+ * `search-found` (results are in hand and the grounded reply is being
+ * written) — driven by the brain route's streamed progress events.
  *
  * The loop resumes Listening after every reply — no tap needed for the next
  * turn. Ten seconds of silence while Listening settles it back to Idle, and
@@ -57,6 +62,26 @@ import type {
  */
 const SILENCE_TIMEOUT_MS = 10_000;
 
+/**
+ * How long the WebSocket handshake may take before the start is reported as
+ * failed. The start sequence is bounded end to end, so "connecting" can never
+ * become a permanent state the person has to escape with a manual Stop.
+ */
+const CONNECT_TIMEOUT_MS = 8_000;
+
+/**
+ * How long a PREFETCHED token stays usable.
+ *
+ * The server mints tokens with a 60 s redemption window, and a redeemed token
+ * is single-use. Holding one for at most 20 s — and only until it is actually
+ * claimed — keeps the prefetch comfortably inside its own lifetime, so a
+ * prefetched token can never be the thing that makes a start fail. Nothing
+ * about this changes authentication or rate limiting: the token still comes
+ * from the authenticated `/api/voice/token` route, which still costs one request
+ * against the same per-user limit.
+ */
+const TOKEN_PREFETCH_MAX_AGE_MS = 20_000;
+
 export interface UseVoiceSessionResult {
   status: VoiceStatus;
   /** Set only while `status === "error"`. */
@@ -73,6 +98,15 @@ export interface UseVoiceSessionResult {
   languageNotice: string | null;
   /** True between `start()` succeeding and `stop()`. */
   isActive: boolean;
+  /**
+   * Warm the token for the next session.
+   *
+   * Best-effort and safe to call on hover, focus or any "about to talk"
+   * gesture: it never opens a socket, never touches the microphone, never
+   * throws, and a prefetched token that is not used inside
+   * `TOKEN_PREFETCH_MAX_AGE_MS` is simply discarded.
+   */
+  prefetch: () => void;
   start: () => Promise<void>;
   stop: () => void;
   clearTranscript: () => void;
@@ -204,6 +238,27 @@ export function useVoiceSession(): UseVoiceSessionResult {
    */
   const epochRef = useRef(0);
   /**
+   * SESSION EPOCH — the guard for the REPLY half of the loop.
+   *
+   * Separate from `epochRef` on purpose. `epochRef` is about a RECOGNIZER (and
+   * is bumped when the engine is swapped mid-conversation, e.g. the Bangla
+   * escalation). This one is about the SESSION (bumped only by `start()` and
+   * `stop()`), because a reply that is in flight must survive a recognizer
+   * swap — the person asked a question and expects an answer — while it must
+   * never survive a Stop or a restart.
+   */
+  const sessionEpochRef = useRef(0);
+  /** In-flight token fetch / handshake for the CURRENT start, so Stop can end it. */
+  const startupAbortRef = useRef<AbortController | null>(null);
+  /** In-flight brain request for the CURRENT turn, so Stop can cancel it. */
+  const turnAbortRef = useRef<AbortController | null>(null);
+  /** A token minted ahead of the tap, waiting to be claimed. Single-use. */
+  const tokenPrefetchRef = useRef<{ token: string; at: number } | null>(null);
+  /** Pending animation frame for a coalesced partial-transcript update. */
+  const partialFrameRef = useRef<number | null>(null);
+  /** Latest partial text waiting for that frame. */
+  const pendingPartialRef = useRef<string | null>(null);
+  /**
    * Mirror of the finalized turns, so the brain always receives full context
    * without reading state that may be stale inside async callbacks.
    */
@@ -214,6 +269,119 @@ export function useVoiceSession(): UseVoiceSessionResult {
     setStatus(next);
   }, []);
 
+  /**
+   * PARTIAL TRANSCRIPTS, COALESCED TO ONE UPDATE PER FRAME.
+   *
+   * The recognizer revises the current utterance many times a second, and each
+   * revision used to be its own React state update — so the whole console (the
+   * transcript list, the orb, the status pill, the aurora layers) re-rendered
+   * at stream rate, on the main thread that also has to keep the orb smooth.
+   * Only the newest revision matters to the eye, so intermediate ones are
+   * dropped and at most one update is committed per animation frame. Finalized
+   * turns never go through this path — they are appended directly.
+   */
+  const pushPartial = useCallback((text: string) => {
+    pendingPartialRef.current = text;
+
+    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+      pendingPartialRef.current = null;
+      setPartialTranscript(text);
+      return;
+    }
+
+    if (partialFrameRef.current !== null) {
+      return;
+    }
+
+    partialFrameRef.current = window.requestAnimationFrame(() => {
+      partialFrameRef.current = null;
+
+      const next = pendingPartialRef.current;
+      pendingPartialRef.current = null;
+
+      if (next !== null) {
+        setPartialTranscript(next);
+      }
+    });
+  }, []);
+
+  /** Drop a pending partial frame — used by Stop, so nothing revives the buffer. */
+  const discardPartialFrame = useCallback(() => {
+    if (partialFrameRef.current !== null && typeof window !== "undefined") {
+      window.cancelAnimationFrame(partialFrameRef.current);
+    }
+
+    partialFrameRef.current = null;
+    pendingPartialRef.current = null;
+  }, []);
+
+  /**
+   * The streaming token for the next session — from the prefetch when one is
+   * still fresh, otherwise straight from the authenticated route.
+   *
+   * A prefetched token is CLAIMED here (removed from the ref before use), so it
+   * is used at most once: AssemblyAI tokens are single-use, and handing the same
+   * one to two sessions would fail the second with no explanation.
+   */
+  const acquireToken = useCallback(async (signal: AbortSignal): Promise<string> => {
+    const prefetched = tokenPrefetchRef.current;
+    tokenPrefetchRef.current = null;
+
+    if (prefetched !== null && Date.now() - prefetched.at <= TOKEN_PREFETCH_MAX_AGE_MS) {
+      return prefetched.token;
+    }
+
+    const response = await fetch("/api/voice/token", {
+      cache: "no-store",
+      signal,
+    });
+    const payload = (await response.json()) as TokenPayload;
+
+    if (!response.ok || !payload.token) {
+      throw new Error(
+        payload.error ?? "Could not start a voice session. Please try again."
+      );
+    }
+
+    return payload.token;
+  }, []);
+
+  /**
+   * Mint a token ahead of the tap, so the start sequence has one less round trip
+   * on the critical path.
+   *
+   * Deliberately conservative: it does nothing while a session is live, it never
+   * opens a socket or the microphone, it stores at most ONE token, and any
+   * failure is swallowed. The token is still minted by the same
+   * auth-checked, rate-limited route, so nothing about security or budgeting
+   * changes — only WHEN the request happens.
+   */
+  const prefetch = useCallback(() => {
+    if (activeRef.current || tokenPrefetchRef.current !== null) {
+      return;
+    }
+
+    void (async () => {
+      try {
+        const response = await fetch("/api/voice/token", { cache: "no-store" });
+
+        if (!response.ok) {
+          return;
+        }
+
+        const payload = (await response.json()) as TokenPayload;
+
+        // A session may have started while this was in flight: don't hold a
+        // token for a session that is already live.
+        if (payload.token && !activeRef.current) {
+          tokenPrefetchRef.current = { token: payload.token, at: Date.now() };
+        }
+      } catch {
+        // Prefetch is an optimisation; a failure just means the tap pays full price.
+      }
+    })();
+  }, []);
+
   const nextTurnId = useCallback(() => {
     turnCounterRef.current += 1;
     return `turn-${turnCounterRef.current}`;
@@ -222,6 +390,12 @@ export function useVoiceSession(): UseVoiceSessionResult {
   const fail = useCallback(
     (message: string) => {
       activeRef.current = false;
+      // A failed start must not leave a token fetch or a handshake running.
+      startupAbortRef.current?.abort();
+      startupAbortRef.current = null;
+      turnAbortRef.current?.abort();
+      turnAbortRef.current = null;
+      discardPartialFrame();
       browserSttRef.current?.stop();
       browserSttRef.current = null;
       streamRef.current?.terminate();
@@ -233,7 +407,7 @@ export function useVoiceSession(): UseVoiceSessionResult {
       setStatusSafe("error");
       setPartialTranscript("");
     },
-    [setStatusSafe]
+    [discardPartialFrame, setStatusSafe]
   );
 
   /** Fully tears the session down and returns to Idle. Idempotent. */
@@ -247,6 +421,20 @@ export function useVoiceSession(): UseVoiceSessionResult {
      * "old buffer became the next turn" report — the epoch check drops it.
      */
     epochRef.current += 1;
+    /*
+     * The SESSION epoch moves too, so a reply that is still being written (or a
+     * handshake that is still opening) belongs to a session that no longer
+     * exists. That is the difference between "Stop" and "Stop, but she answers
+     * anyway" — the ghost reply.
+     */
+    sessionEpochRef.current += 1;
+
+    // End anything still in flight for this session, then release the devices.
+    startupAbortRef.current?.abort();
+    startupAbortRef.current = null;
+    turnAbortRef.current?.abort();
+    turnAbortRef.current = null;
+    discardPartialFrame();
 
     stopSpeaking();
 
@@ -262,7 +450,7 @@ export function useVoiceSession(): UseVoiceSessionResult {
     setPartialTranscript("");
     setErrorMessage(null);
     setStatusSafe("idle");
-  }, [setStatusSafe]);
+  }, [discardPartialFrame, setStatusSafe]);
 
   // Never leave the microphone or socket running after unmount.
   useEffect(() => stop, [stop]);
@@ -311,7 +499,8 @@ export function useVoiceSession(): UseVoiceSessionResult {
         }
 
         if (statusRef.current === "listening") {
-          setPartialTranscript(partial);
+          // Coalesced: one commit per frame, never one per revision.
+          pushPartial(partial);
         }
       },
       onFinal: (text: string, languageCode?: string) => {
@@ -325,7 +514,7 @@ export function useVoiceSession(): UseVoiceSessionResult {
       },
       onError,
     }),
-    []
+    [pushPartial]
   );
 
   /** Tears down whichever recognizer is live, leaving the session active. */
@@ -377,37 +566,38 @@ export function useVoiceSession(): UseVoiceSessionResult {
   const openAssemblyAi = useCallback(
     async (onError: (message: string) => void) => {
       /*
-       * Captured BEFORE the token round trip, not after: a stop that lands
-       * mid-fetch must make this whole open stale, and a recognizer whose epoch
-       * is already retired is never opened at all (the guard after the fetch).
+       * MICROPHONE AND TOKEN, TOGETHER.
+       *
+       * The two halves of the start handshake are independent, so they run
+       * CONCURRENTLY: the permission prompt and the audio graph are being set up
+       * while the token round trip is in flight, and the socket opens as soon as
+       * both land. Sequentially this was mic → token → socket, which is why a
+       * tap felt slow even on a fast connection.
+       *
+       * Captured BEFORE either is started, so a Stop that lands mid-flight makes
+       * the whole attempt stale and nothing is opened.
        */
       const epoch = epochRef.current;
 
-      const response = await fetch("/api/voice/token", { cache: "no-store" });
-      const payload = (await response.json()) as TokenPayload;
-
-      if (!response.ok || !payload.token) {
-        throw new Error(
-          payload.error ?? "Could not start a voice session. Please try again."
-        );
-      }
-
-      // The session moved on while the token was in flight: open nothing. The
-      // caller's own `activeRef` check decides what happens next, so no error is
-      // raised and no orphaned (billable) socket is left behind.
-      if (epochRef.current !== epoch) {
-        return;
-      }
+      // Retire any previous attempt's controller so only the newest start can
+      // be the one Stop ends.
+      startupAbortRef.current?.abort();
+      const startup = new AbortController();
+      startupAbortRef.current = startup;
 
       const recorder = new PcmRecorder({
         onChunk: (chunk) => {
           const current = statusRef.current;
           // Never transcribe Elara's own voice back to herself, and drop audio
-          // captured before the socket is ready ("connecting").
+          // captured before the socket is ready ("connecting"). The two LIVE
+          // states count as "not listening" too: while the server is searching
+          // or writing the grounded reply, the mic stays parked.
           if (
             current === "speaking" ||
             current === "thinking" ||
-            current === "connecting"
+            current === "connecting" ||
+            current === "searching" ||
+            current === "search-found"
           ) {
             return;
           }
@@ -415,7 +605,30 @@ export function useVoiceSession(): UseVoiceSessionResult {
         },
       });
 
-      const sampleRate = await recorder.start();
+      let sampleRate: number;
+      let token: string;
+
+      try {
+        [sampleRate, token] = await Promise.all([
+          recorder.start(),
+          acquireToken(startup.signal),
+        ]);
+      } catch (error) {
+        // Release the half that DID open. Without this, a granted microphone
+        // whose socket never opened keeps the recording indicator on with
+        // nothing listening to it.
+        startup.abort();
+        recorder.stop();
+        throw error;
+      }
+
+      // The session moved on while the handshake was in flight: open nothing.
+      // No error is raised and no orphaned (billable) socket is left behind.
+      if (epochRef.current !== epoch || !activeRef.current) {
+        recorder.stop();
+        return;
+      }
+
       recorderRef.current = recorder;
 
       const stream = new AssemblyAiStream();
@@ -424,17 +637,46 @@ export function useVoiceSession(): UseVoiceSessionResult {
       const speechModel = getStreamingModel(DEFAULT_VOICE_LANGUAGE);
 
       if (speechModel === null) {
+        recorder.stop();
+        if (streamRef.current === stream) {
+          streamRef.current = null;
+        }
         throw new Error("Could not open the voice model. Please try again.");
       }
 
-      await stream.connect({
-        token: payload.token,
-        sampleRate,
-        speechModel,
-        callbacks: buildCallbacks(onError, epoch),
-      });
+      try {
+        await stream.connect({
+          token,
+          sampleRate,
+          speechModel,
+          callbacks: buildCallbacks(onError, epoch),
+          // Bounded, so "connecting" can never hang forever.
+          timeoutMs: CONNECT_TIMEOUT_MS,
+        });
+      } catch (error) {
+        /*
+         * A Stop that landed mid-handshake has already torn this down through
+         * its own refs, so this only cleans up after a genuine failure — and it
+         * never double-cleans a session that Stop already ended.
+         */
+        if (startupAbortRef.current === startup) {
+          stream.terminate();
+
+          if (streamRef.current === stream) {
+            streamRef.current = null;
+          }
+
+          recorder.stop();
+
+          if (recorderRef.current === recorder) {
+            recorderRef.current = null;
+          }
+        }
+
+        throw error;
+      }
     },
-    [buildCallbacks]
+    [acquireToken, buildCallbacks]
   );
 
   /**
@@ -522,6 +764,15 @@ export function useVoiceSession(): UseVoiceSessionResult {
         return;
       }
 
+      /*
+       * The session this reply belongs to. Checked again after EVERY await in
+       * the reply chain below, so a Stop (or a restart) drops the whole turn
+       * instead of letting a reply arrive for a conversation that has ended.
+       */
+      const turnEpoch = sessionEpochRef.current;
+
+      // Any queued partial belongs to the utterance that just ended.
+      discardPartialFrame();
       setPartialTranscript("");
 
       /*
@@ -647,7 +898,43 @@ export function useVoiceSession(): UseVoiceSessionResult {
 
       setStatusSafe("thinking");
 
+      /*
+       * LIVE SEARCH PROGRESS — the route streams `searching` when the
+       * pre-model Bright Data lookup starts and `searched` when it resolves.
+       * The statuses are applied only while the turn is still in one of its
+       * thinking-phase states: a stale event from an aborted turn must never
+       * drag a newer `listening` turn (or a fresh `speaking` one) back into
+       * the search states. A failed lookup (`found: false`) returns to
+       * `thinking`, from which the honest line is spoken like any other reply.
+       */
+      const handleBrainProgress = (progress: BrainProgress) => {
+        const current = statusRef.current;
+
+        if (
+          current !== "thinking" &&
+          current !== "searching" &&
+          current !== "search-found"
+        ) {
+          return;
+        }
+
+        if (progress.phase === "searching") {
+          setStatusSafe("searching");
+        } else {
+          setStatusSafe(progress.found ? "search-found" : "thinking");
+        }
+      };
+
       void (async () => {
+        /*
+         * A per-turn abort: a Stop that lands while the brain is still thinking
+         * cancels the request outright rather than leaving it to resolve into a
+         * session that no longer exists.
+         */
+        const turn = new AbortController();
+        turnAbortRef.current?.abort();
+        turnAbortRef.current = turn;
+
         /*
          * Recent context (excluding the turn just finalized) for the brain.
          *
@@ -666,10 +953,13 @@ export function useVoiceSession(): UseVoiceSessionResult {
           text,
           brainHistory,
           replyLanguage,
-          emotion
+          emotion,
+          turn.signal,
+          handleBrainProgress
         );
 
-        if (!activeRef.current) {
+        // Stop while thinking: nothing is appended and nothing is spoken.
+        if (turnEpoch !== sessionEpochRef.current || !activeRef.current) {
           return;
         }
 
@@ -685,16 +975,21 @@ export function useVoiceSession(): UseVoiceSessionResult {
 
         await speak({ text: result.reply, lang: ttsLang, emotion });
 
+        // Stop while speaking: the TTS has already been cancelled by `stop()`,
+        // and the session must not be dragged back to `listening` by a turn
+        // that ended before the audio did.
+        if (turnEpoch !== sessionEpochRef.current || !activeRef.current) {
+          return;
+        }
+
         // Resume listening so the person can speak the next turn without
         // tapping the orb again. The 10s silence timeout settles the session
         // to Idle if nobody speaks. (If they already tapped Stop while Elara
         // was talking, there is nothing to do.)
-        if (activeRef.current) {
-          setStatusSafe("listening");
-        }
+        setStatusSafe("listening");
       })();
     },
-    [nextTurnId, setStatusSafe, switchEngine]
+    [discardPartialFrame, nextTurnId, setStatusSafe, switchEngine]
   );
 
   // Keep the recognizer helpers pointed at the current finalized-turn handler.
@@ -703,10 +998,13 @@ export function useVoiceSession(): UseVoiceSessionResult {
   }, [handleFinalTurn]);
 
   /**
-   * Requests the mic, mints a token, and opens the STT socket.
+   * Requests the microphone and mints the streaming token — TOGETHER — then
+   * opens the STT socket.
    *
-   * Order matters: the microphone prompt happens before the socket is opened,
-   * so a denied permission never leaves an orphaned (billable) session.
+   * The two acquisitions are independent, so they overlap: the permission
+   * prompt and the audio graph are set up while the token round trip is in
+   * flight. The socket still opens only after BOTH have succeeded, so a denied
+   * permission can never leave an orphaned (billable) session behind.
    */
   const start = useCallback(async () => {
     if (activeRef.current) {
@@ -716,9 +1014,27 @@ export function useVoiceSession(): UseVoiceSessionResult {
     setErrorMessage(null);
     setLanguageNotice(null);
     setPartialTranscript("");
+    discardPartialFrame();
+
+    /*
+     * TTS IS WARMED AS THE SESSION STARTS.
+     *
+     * The platform voice list is read here, in parallel with the microphone and
+     * the token, so the first reply never has to wait for it — the cost is paid
+     * while the person is still opening their mouth.
+     */
+    warmupVoices();
+
     // A fresh epoch: nothing a previous recognizer still emits can reach this
     // session as a partial, a turn or a repeated reply.
     epochRef.current += 1;
+    /*
+     * A fresh SESSION epoch too: any reply still in flight from the previous
+     * session is now stale, so a Stop → tap → talk sequence can never let the
+     * old answer surface in the new conversation.
+     */
+    sessionEpochRef.current += 1;
+    const session = sessionEpochRef.current;
     // A new session starts with no language pinned — the lock rebuilds per turn.
     englishOnlyRef.current = false;
     pinnedLanguageRef.current = null;
@@ -751,6 +1067,25 @@ export function useVoiceSession(): UseVoiceSessionResult {
 
       setStatusSafe("listening");
     } catch (error) {
+      /*
+       * A cancelled start is NOT an error. If the person tapped Stop while the
+       * microphone or the token was still being acquired, the session is
+       * already gone by design — the refs are released and no red box appears.
+       */
+      if (!activeRef.current || session !== sessionEpochRef.current) {
+        return;
+      }
+
+      if (
+        error instanceof Error &&
+        error.message === MICROPHONE_CANCELLED_MESSAGE
+      ) {
+        // Cancelled mid-acquire: settle back to Idle through the normal path so
+        // "connecting" can never become a state the person has to escape.
+        stop();
+        return;
+      }
+
       // A socket failure has already reported something specific via `onError`
       // (e.g. "token may have expired"). Don't overwrite it with a generic
       // "closed before ready" message.
@@ -762,7 +1097,7 @@ export function useVoiceSession(): UseVoiceSessionResult {
         );
       }
     }
-  }, [fail, openAssemblyAi, openBrowserRecognizer, setStatusSafe, stop]);
+  }, [discardPartialFrame, fail, openAssemblyAi, openBrowserRecognizer, setStatusSafe, stop]);
 
   /*
    * There is deliberately no `setLanguage`. Language is detected from the turn
@@ -782,6 +1117,8 @@ export function useVoiceSession(): UseVoiceSessionResult {
     status === "connecting" ||
     status === "listening" ||
     status === "thinking" ||
+    status === "searching" ||
+    status === "search-found" ||
     status === "speaking";
 
   return {
@@ -792,6 +1129,7 @@ export function useVoiceSession(): UseVoiceSessionResult {
     language,
     languageNotice,
     isActive,
+    prefetch,
     start,
     stop,
     clearTranscript,

@@ -29,6 +29,23 @@ export interface BrainResult {
   meta: BrainMeta;
 }
 
+/**
+ * Server → client progress for a turn, streamed while the reply is computed.
+ *
+ * `searching` fires when a LIVE turn enters the pre-model Bright Data lookup;
+ * `searched` reports its outcome (`found: true` when snippets are in hand and
+ * the grounded synthesis can run). CHAT turns emit nothing. Deliberately
+ * content-free: never the query, the results, or a provider/model name — only
+ * the phase, so the UI can show "Searching live…" / "Found live results" while
+ * the request is still in flight without leaking anything about the pipeline.
+ */
+export type BrainProgress =
+  | { phase: "searching" }
+  | { phase: "searched"; found: boolean };
+
+/** Invoked (if provided) as a turn's live-search phases are reached. */
+export type BrainProgressCallback = (progress: BrainProgress) => void;
+
 export function emptyMeta(): BrainMeta {
   return {
     usedSearch: false,
