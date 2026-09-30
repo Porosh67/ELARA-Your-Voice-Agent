@@ -6,8 +6,8 @@ import { updateSession } from "@/lib/supabase/proxy";
  *
  * Responsibilities:
  *  1. Refresh the Supabase auth session on every matched request.
- *  2. Guard protected routes (`/app/*`) — redirect unauthenticated users to
- *     `/login`, preserving the intended destination.
+ *  2. Guard protected routes (`/app/*`, `/settings`) — redirect unauthenticated
+ *     users to `/login`, preserving the intended destination.
  *  3. Redirect already-authenticated users away from `/login` and `/signup`.
  *
  * Note: This is a convenience/UX layer. Authorization is ALSO enforced
@@ -15,7 +15,22 @@ import { updateSession } from "@/lib/supabase/proxy";
  * proxy matchers can be bypassed by refactors.
  */
 
-const PROTECTED_PREFIXES = ["/app"];
+const PROTECTED_PREFIXES = ["/app", "/settings"];
+
+/**
+ * `/forgot-password` and `/reset-password` are deliberately ABSENT from this
+ * list, and that is load-bearing rather than an oversight:
+ *
+ *  - `/reset-password` is reached from a recovery link, so the person IS signed
+ *    in by the time they arrive (the callback exchanged the one-time code for a
+ *    session). Listing it as an auth route would bounce them straight to /app
+ *    and the form would never render.
+ *  - `/forgot-password` is useful to somebody who is already signed in, and
+ *    gating it would only stop a legitimate password change.
+ *
+ * Adding either route here breaks password recovery. Both pages do their own
+ * session checks instead.
+ */
 const AUTH_ROUTES = ["/login", "/signup"];
 
 export async function proxy(request: NextRequest) {

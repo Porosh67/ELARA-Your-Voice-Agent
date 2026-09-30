@@ -1,50 +1,59 @@
 "use client";
 
 import { useMemo } from "react";
+import { Check, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  PASSWORD_RULES,
+  PASSWORD_STRENGTH_LABELS,
+  passwordStrengthLevel,
+  type PasswordStrengthLevel,
+} from "@/lib/auth/password-policy";
 
-const LABELS = [
-  "Too short",
-  "Weak",
-  "Fair",
-  "Strong",
-  "Excellent",
-] as const;
-
-const SEGMENT_COLORS = [
-  "bg-foreground/10",
-  "bg-red-500/70",
-  "bg-amber-500/70",
-  "bg-primary/70",
-  "bg-emerald-500/70",
-] as const;
-
-function scorePassword(password: string): number {
-  if (password.length < 6) {
-    return 0;
-  }
-
-  let score = 0;
-  if (password.length >= 8) score += 1;
-  if (/[a-z]/.test(password) && /[A-Z]/.test(password)) score += 1;
-  if (/\d/.test(password)) score += 1;
-  if (/[^A-Za-z0-9]/.test(password)) score += 1;
-  return Math.min(score, 4);
-}
+/**
+ * Segment colour per level. Index 0 is the empty state, so an unfilled meter
+ * never looks like a red warning before anything has been typed.
+ */
+const SEGMENT_COLORS: Record<PasswordStrengthLevel, string> = {
+  0: "bg-foreground/10",
+  1: "bg-red-500/70",
+  2: "bg-amber-500/70",
+  3: "bg-primary/70",
+  4: "bg-emerald-500/70",
+};
 
 interface PasswordStrengthProps {
   password: string;
+  /** Hide the per-rule checklist where space is tight (the reset form). */
+  showChecklist?: boolean;
 }
 
-/** Four-segment strength meter for the signup form. */
-export function PasswordStrength({ password }: PasswordStrengthProps) {
-  const { score, label } = useMemo(
-    () => {
-      const value = scorePassword(password);
-      return { score: value, label: LABELS[value] };
-    },
-    [password],
-  );
+/**
+ * Live strength meter (4 segments + label) and the checklist of unmet rules.
+ *
+ * The scoring comes from the SHARED policy module, never from a local copy, so
+ * the meter cannot disagree with the server: if a rule shows as met here, the
+ * server accepts it, and vice versa.
+ *
+ * Rendered as a live region so a screen reader hears the label change as the
+ * person types.
+ */
+export function PasswordStrength({
+  password,
+  showChecklist = true,
+}: PasswordStrengthProps) {
+  const { level, unmet } = useMemo(() => {
+    const metIds = new Set(
+      PASSWORD_RULES.filter((rule) => rule.test(password)).map((rule) => rule.id)
+    );
+
+    return {
+      level: passwordStrengthLevel(password),
+      unmet: new Set(
+        PASSWORD_RULES.filter((rule) => !metIds.has(rule.id)).map((rule) => rule.id)
+      ),
+    };
+  }, [password]);
 
   if (password.length === 0) {
     return null;
@@ -58,15 +67,42 @@ export function PasswordStrength({ password }: PasswordStrengthProps) {
             key={index}
             className={cn(
               "h-1 flex-1 rounded-full transition-colors duration-300",
-              index < score ? SEGMENT_COLORS[score] : "bg-foreground/10",
+              index < level ? SEGMENT_COLORS[level] : "bg-foreground/10"
             )}
           />
         ))}
       </div>
+
       <p className="text-xs text-muted-foreground">
         Password strength:{" "}
-        <span className="text-foreground/90">{label}</span>
+        <span className="text-foreground/90">{PASSWORD_STRENGTH_LABELS[level]}</span>
       </p>
+
+      {showChecklist ? (
+        <ul className="flex flex-col gap-1">
+          {PASSWORD_RULES.map((rule) => {
+            const met = !unmet.has(rule.id);
+
+            return (
+              <li
+                key={rule.id}
+                className={cn(
+                  "flex items-center gap-1.5 text-xs transition-colors",
+                  met ? "text-emerald-500 dark:text-emerald-400" : "text-muted-foreground"
+                )}
+              >
+                {met ? (
+                  <Check className="h-3 w-3 shrink-0" aria-hidden="true" />
+                ) : (
+                  <X className="h-3 w-3 shrink-0 opacity-50" aria-hidden="true" />
+                )}
+                <span>{rule.label}</span>
+                <span className="sr-only">{met ? " — met" : " — not met yet"}</span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
     </div>
   );
 }

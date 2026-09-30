@@ -1,11 +1,13 @@
 import { redirect } from "next/navigation";
-import { User } from "lucide-react";
+import Link from "next/link";
+import { User, Settings as SettingsIcon } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
 import { SignOutButton } from "@/components/auth/sign-out-button";
 import { VoiceConsole } from "@/components/app/voice-console";
 import { AuroraBackground } from "@/components/ui/aurora-background";
-import { Logo } from "@/components/layout/logo";
+import { Logo } from "@/components/brand/logo";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
+import { ensureUserRows } from "@/lib/data/user-data";
 import type { Profile } from "@/types/database";
 
 /**
@@ -25,11 +27,21 @@ export default async function AppPage() {
     redirect("/login?redirect=/app");
   }
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("*")
-    .eq("id", user.id)
-    .maybeSingle<Profile>();
+  /*
+   * SELF-HEAL ON LOAD.
+   *
+   * The `handle_new_user` trigger normally creates the profile and settings
+   * rows at signup, so this is normally a no-op. It exists because rows can go
+   * missing for reasons the trigger cannot prevent — a hand edit in the table
+   * editor, a partial restore, a database created before the trigger existed —
+   * and a single missing row would otherwise make every later write a silent
+   * no-op forever, with the UI claiming history is saved when it is not.
+   *
+   * `ensureUserRows` uses INSERT ... ON CONFLICT DO NOTHING, so an existing row
+   * keeps its real values; this can only ever fill a genuine gap.
+   */
+  const { profile: healedProfile, settings } = await ensureUserRows(user);
+  const profile = healedProfile as Profile | null;
 
   const isGuest = profile?.is_guest ?? Boolean(user.is_anonymous);
   const displayName =
@@ -43,6 +55,14 @@ export default async function AppPage() {
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-6 px-6 py-5">
           <Logo />
           <div className="flex items-center gap-3">
+            <Link
+              href="/settings"
+              className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-border/60 px-3 text-sm font-medium text-foreground/80 transition-colors hover:border-primary/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <SettingsIcon className="h-4 w-4" aria-hidden="true" />
+              <span className="hidden sm:inline">Settings</span>
+              <span className="sr-only sm:hidden">Settings</span>
+            </Link>
             <ThemeToggle variant="compact" />
             <SignOutButton />
           </div>
@@ -86,7 +106,11 @@ export default async function AppPage() {
             would push its top out of scroll range on short screens.
           */}
           <div className="m-auto w-full max-w-xl">
-            <VoiceConsole />
+            <VoiceConsole
+              userId={user.id}
+              memoryEnabled={settings?.memory_enabled ?? true}
+              displayName={displayName}
+            />
           </div>
         </div>
       </div>

@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Logo } from "@/components/layout/logo";
+import { Logo } from "@/components/brand/logo";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 
 const linkGroups = [

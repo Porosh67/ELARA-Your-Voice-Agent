@@ -94,6 +94,36 @@ const POST_SPEECH_ECHO_SETTLE_MS = 400;
  */
 const TOKEN_PREFETCH_MAX_AGE_MS = 20_000;
 
+/**
+ * Optional observer for delivered turns.
+ *
+ * A pure NOTIFICATION channel, deliberately kept out of the voice logic: the
+ * hook knows nothing about persistence, and the caller (the console) knows
+ * nothing about audio. The observer is invoked with a finalized, already-spoken
+ * turn, and MUST NOT block, await, or throw — a slow or failing listener cannot
+ * be allowed to affect a reply, because Elara is already talking by the time
+ * this fires.
+ */
+export interface VoiceTurnObserver {
+  /** A person's finalized utterance, before the reply. */
+  onUserTurn?: (text: string) => void;
+  /** Elara's reply, AFTER it has been delivered and spoken. */
+  onAssistantTurn?: (text: string) => void;
+  /** A voice session started. */
+  onSessionStart?: () => void;
+  /** A voice session ended. */
+  onSessionEnd?: () => void;
+}
+
+export interface UseVoiceSessionOptions {
+  /**
+   * Where to observe delivered turns. Passed as an object literal by callers, so
+   * it is captured in a ref internally and never becomes an effect dependency —
+   * an unstable identity must not re-run any part of the voice loop.
+   */
+  observer?: VoiceTurnObserver;
+}
+
 export interface UseVoiceSessionResult {
   status: VoiceStatus;
   /** Set only while `status === "error"`. */
@@ -168,7 +198,45 @@ function acceptedReportedLanguage(
   return isVoiceLanguageCode(primary) ? primary : null;
 }
 
-export function useVoiceSession(): UseVoiceSessionResult {
+export function useVoiceSession(options: UseVoiceSessionOptions = {}): UseVoiceSessionResult {
+  /*
+   * The observer is held in a ref so its identity can never invalidate an
+   * effect. The voice loop must not care that a new inline object literal was
+   * created on the caller's render.
+   *
+   * Assigned in an EFFECT rather than during render: writing a ref while
+   * rendering is what the React compiler rules forbid, and it would also mean
+   * two renders in the same commit could disagree about the observer.
+   */
+  const observerRef = useRef<VoiceTurnObserver | null>(null);
+  const observerOption = options.observer;
+
+  useEffect(() => {
+    observerRef.current = observerOption ?? null;
+  }, [observerOption]);
+
+  /** Fire-and-forget: an observer must never be able to stall or break a turn. */
+  const notify = useCallback(
+    (
+      channel: "onUserTurn" | "onAssistantTurn" | "onSessionStart" | "onSessionEnd",
+      ...args: string[]
+    ) => {
+      const handler = observerRef.current?.[channel];
+
+      if (typeof handler !== "function") {
+        return;
+      }
+
+      try {
+        (handler as (...values: string[]) => void)(...args);
+      } catch {
+        // Swallowed on purpose: a broken listener is the listener's problem,
+        // never the conversation's.
+      }
+    },
+    []
+  );
+
   const [status, setStatus] = useState<VoiceStatus>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [turns, setTurns] = useState<TranscriptTurn[]>([]);
@@ -1036,7 +1104,22 @@ export function useVoiceSession(): UseVoiceSessionResult {
         setTurns(turnsRef.current);
         setStatusSafe("speaking");
 
+        /*
+         * The person's turn is announced as soon as it is FINALIZED, before the
+         * brain call, so the two halves of an exchange are recorded in order.
+         * Fire-and-forget: nothing downstream of this may delay the reply.
+         */
+        notify("onUserTurn", text);
+
         await speak({ text: result.reply, lang: ttsLang, emotion });
+
+        /*
+         * The reply is announced AFTER `speak()` resolves, i.e. once it has
+         * actually been delivered. An observer that persists it therefore cannot
+         * delay, reorder or interrupt speech — which is the whole reason saving
+         * lives outside this hook.
+         */
+        notify("onAssistantTurn", result.reply);
 
         // Stop while speaking: the TTS has already been cancelled by `stop()`,
         // and the session must not be dragged back to `listening` by a turn
@@ -1078,7 +1161,7 @@ export function useVoiceSession(): UseVoiceSessionResult {
         setStatusSafe("listening");
       })();
     },
-    [discardPartialFrame, nextTurnId, setStatusSafe, switchEngine]
+    [discardPartialFrame, nextTurnId, notify, setStatusSafe, switchEngine]
   );
 
   // Keep the recognizer helpers pointed at the current finalized-turn handler.
@@ -1131,6 +1214,10 @@ export function useVoiceSession(): UseVoiceSessionResult {
     // Surface the handshake (permission prompt + token + socket open) in the
     // machine itself, so the UI never shows a silent gap while starting.
     setStatusSafe("connecting");
+
+    // One voice session = one saved conversation. Fired here, at the top of a
+    // successful start, so a failed handshake creates no empty transcript.
+    notify("onSessionStart");
 
     try {
       /*
@@ -1186,7 +1273,7 @@ export function useVoiceSession(): UseVoiceSessionResult {
         );
       }
     }
-  }, [discardPartialFrame, fail, openAssemblyAi, openBrowserRecognizer, setStatusSafe, stop]);
+  }, [discardPartialFrame, fail, notify, openAssemblyAi, openBrowserRecognizer, setStatusSafe, stop]);
 
   /*
    * There is deliberately no `setLanguage`. Language is detected from the turn

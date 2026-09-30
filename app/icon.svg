@@ -1,14 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <defs>
-    <linearGradient id="elara-icon-moon" x1="6" y1="26" x2="26" y2="6" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#6366F1"/>
-      <stop offset="0.55" stop-color="#818CF8"/>
-      <stop offset="1" stop-color="#A5B4FC"/>
-    </linearGradient>
-  </defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" role="img" aria-label="Elara">
+  <!--
+    THE ELARA MARK — a stylised "E" assembled from voice-waveform bars.
+    Same geometry as components/brand/logo.tsx, flattened for the favicon and
+    given an explicit indigo stroke because a favicon cannot inherit
+    currentColor: a browser tab background may be light or dark and we cannot
+    know which, so the mark is drawn in the brand colour on a dark rounded
+    plate. That plate is what makes the mark legible at 16px, where a bare
+    indigo E on a white tab would nearly disappear.
+
+    The waveform ticks are omitted here: at favicon size they fall below one
+    device pixel and turn to grey noise. The three-bar rhythm carries it alone.
+  -->
   <rect width="32" height="32" rx="8" fill="#09090B"/>
-  <!-- Crescent — Elara, a moon of Jupiter: present, gentle, never loud. -->
-  <path d="M18 6.5A9.5 9.5 0 0 0 18 25.5A12 12 0 0 1 18 6.5Z" fill="url(#elara-icon-moon)"/>
-  <!-- Four-point sparkle, set in the open sky beside the crescent. -->
-  <path d="M24.2 6.4c.32 1.72.9 2.3 2.62 2.62-1.72.32-2.3.9-2.62 2.62-.32-1.72-.9-2.3-2.62-2.62 1.72-.32 2.3-.9 2.62-2.62Z" fill="#A5B4FC"/>
+  <g
+    stroke="#818CF8"
+    stroke-width="3"
+    stroke-linecap="round"
+  >
+    <!-- The stem: the spine of the E and the axis the waveform crosses. -->
+    <path d="M8 5.5v21"/>
+    <!-- Top bar. -->
+    <path d="M8 6.5h13.5"/>
+    <!-- Middle bar, broken into a three-step waveform. -->
+    <path d="M8 16h2.6"/>
+    <path d="M13.4 16h2.2" opacity="0.75"/>
+    <path d="M18.2 16h2.2" opacity="0.55"/>
+    <!-- Bottom bar, closing the E. -->
+    <path d="M8 25.5h13.5"/>
+  </g>
 </svg>

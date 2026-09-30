@@ -11,6 +11,8 @@ export type MessageRole = "user" | "assistant" | "system";
 export interface Profile {
   id: string;
   email: string | null;
+  /** Chosen at signup. NULL for guest and OAuth users. Added in 0002. */
+  username: string | null;
   display_name: string | null;
   avatar_url: string | null;
   is_guest: boolean;

@@ -15,12 +15,20 @@ import { AuroraBackground } from "@/components/ui/aurora-background";
  * Reads the session so both the header and the calls to action can point
  * signed-in users straight at `/app` (dynamic rendering is accepted by design).
  */
-export default async function Home() {
+export default async function Home({
+  searchParams,
+}: {
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}) {
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
   const ctaHref = user ? "/app" : "/login";
+
+  // Set by the settings delete flow, which has already ended the session.
+  const params = await searchParams;
+  const justDeleted = params.deleted === "1";
 
   return (
     <div className="relative flex flex-1 flex-col">
@@ -29,6 +37,18 @@ export default async function Home() {
       <SiteHeader />
 
       <main id="main-content" className="flex flex-1 flex-col">
+        {justDeleted ? (
+          <div className="mx-auto mt-10 w-full max-w-2xl px-6">
+            <p
+              role="status"
+              className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-5 py-4 text-sm text-emerald-600 dark:text-emerald-400"
+            >
+              Your account and all of its data have been deleted. We&apos;re glad
+              you were here — you&apos;re welcome back any time.
+            </p>
+          </div>
+        ) : null}
+
         <Hero ctaHref={ctaHref} />
         <StatStrip />
         <Features />

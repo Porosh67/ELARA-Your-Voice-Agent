@@ -24,6 +24,13 @@ export default async function LoginPage({
   const errorParam = typeof params.error === "string" ? params.error : undefined;
   const presetError = errorParam ? ERROR_MESSAGES[errorParam] ?? null : null;
 
+  // Sent by /reset-password when the recovery session is gone or already used.
+  const expiredParam =
+    typeof params.reason === "string" && params.reason === "expired";
+  // Sent by the reset form after a successful change.
+  const resetParam =
+    typeof params.reset === "string" && params.reset === "success";
+
   return (
     <AuthCard
       title="Welcome back"
@@ -41,6 +48,31 @@ export default async function LoginPage({
       }
     >
       <div className="flex flex-col gap-6">
+        {resetParam ? (
+          <p
+            role="status"
+            className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-600 dark:text-emerald-400"
+          >
+            Password updated. Sign in with your new password.
+          </p>
+        ) : null}
+
+        {expiredParam ? (
+          <p
+            role="status"
+            className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-600 dark:text-amber-400"
+          >
+            That reset link has expired or was already used.{" "}
+            <Link
+              href="/forgot-password"
+              className="font-medium underline underline-offset-2"
+            >
+              Request a new one
+            </Link>
+            .
+          </p>
+        ) : null}
+
         <AuthForm mode="login" redirectTo={redirectParam} />
 
         <AuthDivider />

@@ -3,7 +3,7 @@ import { AudioLines, ShieldCheck, Sparkles } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { IconTile } from "@/components/ui/icon-tile";
-import { Logo } from "@/components/layout/logo";
+import { Logo } from "@/components/brand/logo";
 import { GlowOrb } from "@/components/ui/glow-orb";
 
 interface ValuePoint {

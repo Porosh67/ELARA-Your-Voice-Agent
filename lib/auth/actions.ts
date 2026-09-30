@@ -4,6 +4,13 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import type { AuthActionState } from "@/lib/auth/action-state";
 import { createClient } from "@/lib/supabase/server";
+import {
+  PASSWORD_MIN_LENGTH,
+  USERNAME_HINT,
+  isPasswordAcceptable,
+  isUsernameWellFormed,
+  normalizeUsername,
+} from "@/lib/auth/password-policy";
 
 /**
  * Auth Server Actions.
@@ -33,6 +40,41 @@ function getSiteOrigin(): string {
     process.env.NEXT_PUBLIC_SITE_URL ??
     "http://localhost:3000"
   );
+}
+
+/**
+ * Turn Supabase's signup errors into something a person can act on.
+ *
+ * The raw message for a duplicate address is "User already registered", which
+ * reads like a database complaint and, worse, is a free oracle for discovering
+ * which addresses have accounts. The email is echoed back in the sentence only
+ * so the person can see WHICH of their own fields was the problem — it is their
+ * own input, and they just typed it.
+ */
+function friendlySignUpError(message: string, email: string): string {
+  const lowered = message.toLowerCase();
+
+  if (
+    lowered.includes("already registered") ||
+    lowered.includes("already been registered") ||
+    lowered.includes("duplicate")
+  ) {
+    return `An account already exists for ${email}. Try logging in instead, or reset your password.`;
+  }
+
+  if (lowered.includes("password")) {
+    return `Password must be at least ${PASSWORD_MIN_LENGTH} characters and include an uppercase letter, a lowercase letter, a number and a symbol.`;
+  }
+
+  if (lowered.includes("email") && lowered.includes("invalid")) {
+    return "That doesn't look like a valid email address.";
+  }
+
+  if (lowered.includes("rate") || lowered.includes("too many")) {
+    return "Too many attempts. Please wait a moment and try again.";
+  }
+
+  return "We couldn't create your account. Please try again.";
 }
 
 export async function signInWithPassword(
@@ -65,14 +107,29 @@ export async function signUp(
   const email = String(formData.get("email") ?? "").trim();
   const password = String(formData.get("password") ?? "");
   const confirmPassword = String(formData.get("confirmPassword") ?? "");
+  const fullName = String(formData.get("fullName") ?? "").trim().slice(0, 120);
+  const rawUsername = String(formData.get("username") ?? "").trim();
 
   if (!email || !password) {
     return { error: "Please enter both your email and password.", message: null };
   }
 
-  if (password.length < 6) {
+  const username = normalizeUsername(rawUsername);
+
+  if (!isUsernameWellFormed(username)) {
     return {
-      error: "Password must be at least 6 characters long.",
+      error: `Choose a username: ${USERNAME_HINT}`,
+      message: null,
+    };
+  }
+
+  /*
+   * The shared policy, re-checked here because the disabled submit button is a
+   * courtesy and not a control: this is the gate that actually holds.
+   */
+  if (!isPasswordAcceptable(password)) {
+    return {
+      error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters and include an uppercase letter, a lowercase letter, a number and a symbol.`,
       message: null,
     };
   }
@@ -82,16 +139,21 @@ export async function signUp(
   }
 
   const supabase = await createClient();
+
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
     options: {
       emailRedirectTo: `${getSiteOrigin()}/auth/callback`,
+      // Read by the handle_new_user trigger. Metadata is a REQUEST, not a
+      // guarantee: the trigger validates the format and stores NULL rather than
+      // raising, and the unique index below is the real authority.
+      data: { username, full_name: fullName || null },
     },
   });
 
   if (error) {
-    return { error: error.message, message: null };
+    return { error: friendlySignUpError(error.message, email), message: null };
   }
 
   // If email confirmation is enabled, there is no active session yet.
@@ -101,6 +163,26 @@ export async function signUp(
       message:
         "Account created. Check your email to confirm your address, then log in.",
     };
+  }
+
+  /*
+   * The session exists, so the account is live. If someone took the username in
+   * the gap between the availability check and this insert, the unique index
+   * fired — but the trigger deliberately swallowed it so the ACCOUNT was still
+   * created. Say so plainly rather than leaving a signed-in user with a handle
+   * that silently is not theirs.
+   */
+  if (data.user) {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("username")
+      .eq("id", data.user.id)
+      .maybeSingle();
+
+    if (profile?.username == null) {
+      revalidatePath("/", "layout");
+      redirect("/app?username=unavailable");
+    }
   }
 
   revalidatePath("/", "layout");

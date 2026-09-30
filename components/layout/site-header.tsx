@@ -3,7 +3,7 @@ import Link from "next/link";
 import { HeaderShell } from "@/components/layout/header-shell";
 import { MobileNav } from "@/components/layout/mobile-nav";
 import { NAV_LINKS } from "@/components/layout/nav-links";
-import { Logo } from "@/components/layout/logo";
+import { Logo } from "@/components/brand/logo";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { ButtonLink } from "@/components/ui/button";
 
