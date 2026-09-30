@@ -44,3 +44,4 @@ lint.log
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+.tsc-status.txt
