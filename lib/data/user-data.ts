@@ -70,12 +70,14 @@ export async function ensureUserRows(
     {
       id: user.id,
       email: user.email ?? null,
-      // Only used when the row does not exist yet; an existing row keeps its
-      // own display name because ON CONFLICT DO NOTHING takes no update.
       display_name: profileFallback,
       is_guest: Boolean(user.is_anonymous),
     },
-    { onConflict: "id" }
+    // `ignoreDuplicates: true` is what actually produces ON CONFLICT DO
+    // NOTHING. Without it PostgREST issues ON CONFLICT DO UPDATE, so every
+    // page load REWROTE `is_guest` and `display_name` — which is what made real
+    // accounts show as guests and replaced a typed name with the email prefix.
+    { onConflict: "id", ignoreDuplicates: true }
   );
 
   if (profileError) {

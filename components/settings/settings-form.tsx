@@ -16,6 +16,13 @@ import {
   usernameFormatError,
 } from "@/lib/auth/password-policy";
 import { VOICE_LANGUAGES } from "@/lib/voice/languages";
+import {
+  authMethodLabel,
+  type AuthMethod,
+} from "@/lib/auth/auth-method";
+
+/** How often a username may be changed. Mirrors the database trigger. */
+const USERNAME_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * THE SETTINGS SCREEN.
@@ -37,6 +44,8 @@ interface ProfileShape {
   email: string | null;
   username: string | null;
   display_name: string | null;
+  /** Last username change, for the 7-day cooldown. */
+  username_changed_at: string | null;
   is_guest: boolean;
 }
 
@@ -52,10 +61,12 @@ export function SettingsForm({
   initialProfile,
   initialSettings,
   isGuest,
+  authMethod,
 }: {
   initialProfile: ProfileShape;
   initialSettings: SettingsShape;
   isGuest: boolean;
+  authMethod: AuthMethod | null;
 }) {
   const router = useRouter();
 
@@ -76,6 +87,13 @@ export function SettingsForm({
   const [deleteConfirm, setDeleteConfirm] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  /*
+   * The clock, read once. `useState` with a lazy initialiser is the only way to
+   * capture a mount-time value without the React compiler flagging an impure
+   * call in the render body.
+   */
+  const [mountedAt] = useState(() => Date.now());
 
   /* ── PREFERENCES ───────────────────────────────────────────────────────── */
 
@@ -118,6 +136,35 @@ export function SettingsForm({
   const nameChanged = displayName.trim() !== (initialProfile.display_name ?? "");
   const usernameChanged = normalizeUsername(username) !== (initialProfile.username ?? "");
   const profileDirty = nameChanged || usernameChanged;
+
+  /*
+   * The 7-DAY USERNAME COOLDOWN — shown, not enforced, on the client.
+   *
+   * The real guarantee is the `enforce_username_cooldown` trigger, because a
+   * client-side check can be bypassed by anything that is not this form. This
+   * copy exists so the rule is VISIBLE — a disabled field with no explanation
+   * reads as a bug — and so the person is told when they can change back rather
+   * than being left guessing.
+   *
+   * Changing the NAME is never rate-limited; only the handle is.
+   */
+  const usernameAvailableAt =
+    initialProfile.username_changed_at === null
+      ? null
+      : new Date(initialProfile.username_changed_at).getTime() + USERNAME_COOLDOWN_MS;
+
+  /*
+   * `now` is captured ONCE on mount rather than read during render. Reading the
+   * clock in the render body makes the output depend on when React happened to
+   * evaluate it, which is both impure and — worse here — would silently
+   * un-lock the field at an unpredictable moment. A page opened within the
+   * cooldown keeps showing the message until it is reopened, which is the
+   * honest behaviour: the server decides, and it has the authoritative clock.
+   */
+  const usernameLocked =
+    usernameAvailableAt !== null &&
+    usernameAvailableAt > mountedAt &&
+    normalizeUsername(username) !== (initialProfile.username ?? "");
 
   async function saveProfile() {
     setSavingProfile(true);
@@ -260,7 +307,15 @@ export function SettingsForm({
               id="username-status"
               className="flex items-center gap-1.5 text-xs text-muted-foreground"
             >
-              {usernameFormat !== null ? (
+              {usernameLocked ? (
+                <>
+                  <X className="h-3 w-3 shrink-0 text-amber-500" aria-hidden="true" />
+                  You can change your username again on{" "}
+                  {new Date(
+                    usernameAvailableAt ?? mountedAt
+                  ).toLocaleDateString()}. Changing your name is always free.
+                </>
+              ) : usernameFormat !== null ? (
                 <>
                   <X className="h-3 w-3 shrink-0 text-red-500" aria-hidden="true" />
                   {usernameFormat}
@@ -288,6 +343,21 @@ export function SettingsForm({
             disabled
           />
 
+          {/*
+           * WHAT KIND OF ACCOUNT THIS IS — stated outright rather than inferred
+           * by the presence or absence of a badge. The old UI labelled every
+           * account "Guest session" and a real user had no way to tell the label
+           * was simply wrong.
+           */}
+          <div className="flex items-center justify-between gap-4 rounded-xl border border-border/60 bg-surface-muted/30 px-4 py-3">
+            <span className="text-sm font-medium text-foreground/90">
+              Account type
+            </span>
+            <span className="text-sm text-muted-foreground">
+              {authMethodLabel(authMethod)}
+            </span>
+          </div>
+
           {profileNotice !== null ? (
             <AuthError
               error={profileNotice.tone === "error" ? profileNotice.text : null}
@@ -300,7 +370,12 @@ export function SettingsForm({
               type="button"
               onClick={() => void saveProfile()}
               loading={savingProfile}
-              disabled={!profileDirty || savingProfile || usernameFormat !== null}
+              disabled={
+                !profileDirty ||
+                savingProfile ||
+                usernameFormat !== null ||
+                usernameLocked
+              }
               size="sm"
             >
               {savingProfile ? "Saving…" : "Save profile"}

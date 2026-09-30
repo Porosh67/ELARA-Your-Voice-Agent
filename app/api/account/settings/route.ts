@@ -42,6 +42,13 @@ const ALLOWED = {
 
 type Field = keyof typeof ALLOWED;
 
+/**
+ * How often a username may be changed. Mirrored by the
+ * `enforce_username_cooldown` trigger in migration 0003 — this constant exists
+ * to produce a human-readable date, not to be the enforcement.
+ */
+const USERNAME_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** Fields that accept an explicit `null` (clearing a chosen voice). */
 const NULLABLE: Field[] = ["tts_voice"];
 
@@ -225,7 +232,7 @@ export async function PUT(request: NextRequest) {
   }
 
   if ("username" in record) {
-    if (record.username === null) {
+    if (record.username === null || record.username === "") {
       // Releasing a handle is allowed, and frees it for someone else.
       patch.username = null;
     } else {
@@ -246,12 +253,43 @@ export async function PUT(request: NextRequest) {
       }
 
       /*
-       * The unique index is the authority, and this route uses the USER-SCOPED
-       * client, so it cannot query the profiles table for another person's row
-       * (RLS returns nothing). That means a genuine collision is caught by the
-       * INSERT/UPDATE itself, not by a pre-check — so the index violation is
-       * what produces the friendly "taken" message below.
+       * THE 7-DAY COOLDOWN — checked here for a USEFUL message, and enforced for
+       * REAL by the `enforce_username_cooldown` database trigger.
+       *
+       * Two layers on purpose. This one can say "you can change it again on the
+       * 12th", which a constraint cannot. The trigger is the actual guarantee:
+       * it holds for every writer, including the table editor and any future
+       * script, and it cannot be forgotten or raced past by two simultaneous
+       * requests that both read a stale `username_changed_at`.
        */
+      const { data: current } = await supabase
+        .from("profiles")
+        .select("username, username_changed_at")
+        .eq("id", user.id)
+        .maybeSingle<{ username: string | null; username_changed_at: string | null }>();
+
+      const previous = current?.username ?? null;
+      const changedAt = current?.username_changed_at ?? null;
+
+      // Re-submitting the SAME handle is not a change, and must never lock
+      // anybody out of saving the rest of their profile.
+      if (username !== previous && changedAt !== null) {
+        const nextAvailable = new Date(changedAt).getTime() + USERNAME_COOLDOWN_MS;
+        const remaining = nextAvailable - Date.now();
+
+        if (remaining > 0) {
+          return NextResponse.json(
+            {
+              error: `You can change your username again on ${new Date(
+                nextAvailable
+              ).toLocaleDateString()}.`,
+              retryAfter: Math.ceil(remaining / 1000),
+            },
+            { status: 429 }
+          );
+        }
+      }
+
       patch.username = username;
     }
   }
@@ -267,6 +305,16 @@ export async function PUT(request: NextRequest) {
     .single();
 
   if (error) {
+    // The cooldown trigger. Reachable only in a genuine race — two requests
+    // that both read a stale `username_changed_at` and both passed the check
+    // above — so the trigger is what actually settles it.
+    if (error.code === "P0001" && error.message.includes("username_cooldown")) {
+      return NextResponse.json(
+        { error: "You can only change your username once every 7 days." },
+        { status: 429 }
+      );
+    }
+
     // 23505 = unique_violation, i.e. the username index.
     if (error.code === "23505") {
       return NextResponse.json(
@@ -275,6 +323,8 @@ export async function PUT(request: NextRequest) {
       );
     }
 
+    // A code, never the message: PostgREST messages can name columns and
+    // constraints, and this route has no need to describe the schema.
     return NextResponse.json(
       { error: "Could not save your profile" },
       { status: 500 }

@@ -7,6 +7,7 @@ import { Logo } from "@/components/brand/logo";
 import { AuroraBackground } from "@/components/ui/aurora-background";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { SettingsForm } from "@/components/settings/settings-form";
+import { authMethodFromUser, isGuestAccount } from "@/lib/auth/auth-method";
 import type { UserSettings } from "@/types/database";
 
 /**
@@ -30,7 +31,8 @@ export default async function SettingsPage() {
 
   const { profile, settings } = await ensureUserRows(user);
 
-  const isGuest = profile?.is_guest ?? Boolean(user.is_anonymous);
+  const isGuest = isGuestAccount(user, profile?.auth_method);
+  const authMethod = authMethodFromUser(user);
 
   return (
     <div className="relative flex min-h-screen flex-1 flex-col">
@@ -67,11 +69,13 @@ export default async function SettingsPage() {
 
         <SettingsForm
           isGuest={isGuest}
+          authMethod={authMethod}
           initialProfile={{
             id: profile?.id ?? user.id,
             email: profile?.email ?? user.email ?? null,
             username: profile?.username ?? null,
             display_name: profile?.display_name ?? null,
+            username_changed_at: profile?.username_changed_at ?? null,
             is_guest: isGuest,
           }}
           initialSettings={{

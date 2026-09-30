@@ -16,6 +16,10 @@ export interface Profile {
   display_name: string | null;
   avatar_url: string | null;
   is_guest: boolean;
+  /** email | google | anonymous. Added in 0003. NULL on a legacy row. */
+  auth_method: string | null;
+  /** Last username change; drives the 7-day cooldown. Added in 0003. */
+  username_changed_at: string | null;
   created_at: string;
   updated_at: string;
 }
